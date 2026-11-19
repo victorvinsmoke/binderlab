@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: "Reche Carrascosa"
+    given-names: "Víctor"
+title: "binderlab: Suite modular de herramientas para el diseño, cribado y monitorización de binders proteicos"
+version: 0.1.0
+date-released: 2024-01-01
+url: "https://github.com/victorreche/binderlab"
+license: MIT

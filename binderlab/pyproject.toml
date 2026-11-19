@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "binderlab"
+version = "0.1.0"
+description = "Herramientas de diseño y monitorización de binders proteicos (BinderMonitor + utilidades)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "Víctor Reche Carrascosa"}]
+keywords = ["protein design", "binder", "RFdiffusion", "ProteinMPNN", "AlphaFold2", "Rosetta", "dash"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: POSIX :: Linux",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+# Dependencias mínimas (dashboard). dnachisel/pyrosetta/tensorflow son
+# opcionales por subcomando y solo se piden al ejecutarlo.
+dependencies = [
+    "dash>=2.9",
+    "dash-bootstrap-components",
+    "dash-molstar",
+    "pandas",
+    "plotly",
+]
+
+[project.optional-dependencies]
+dna = ["dnachisel", "biopython", "python-codon-tables"]
+corr = ["seaborn", "matplotlib", "numpy", "scikit-learn"]
+# El autoencoder de `corr` necesita TensorFlow. Va aparte porque es pesado
+# (~500 MB) y solo hace falta con `-t autoencoder`.
+corr-ae = ["tensorflow"]
+# pyrosetta NO se instala desde PyPI público: requiere licencia de
+# RosettaCommons y su propio canal. Ver https://www.pyrosetta.org/downloads
+score = ["pyrosetta"]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+binderlab = "binderlab.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/victorreche/binderlab"
+Issues = "https://github.com/victorreche/binderlab/issues"
+
+[tool.setuptools]
+packages = ["binderlab", "binderlab.core"]
+
+[tool.setuptools.package-data]
+binderlab = ["presets/*.json", "presets/*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+extend-exclude = ["build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501", "E402", "E701", "E741"]
