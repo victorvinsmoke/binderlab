@@ -46,8 +46,8 @@ dev = ["pytest", "ruff"]
 binderlab = "binderlab.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/victorreche/binderlab"
-Issues = "https://github.com/victorreche/binderlab/issues"
+Homepage = "https://github.com/victorvinsmoke/binderlab"
+Issues = "https://github.com/victorvinsmoke/binderlab/issues"
 
 [tool.setuptools]
 packages = ["binderlab", "binderlab.core"]

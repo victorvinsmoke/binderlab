@@ -1,0 +1,26 @@
+name: binderlab-ci
+on: [push, pull_request]
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Instalar binderlab
+        run: |
+          pip install --upgrade pip
+          pip install ".[dev]"
+      - name: Pruebas automatizadas
+        run: |
+          ruff check binderlab tests
+          pytest
+          python -m binderlab._selfcheck
+      - name: Verificar paquete instalado (sin árbol fuente local)
+        run: |
+          python -c "import os, subprocess, sys; os.chdir('/tmp'); subprocess.check_call([sys.executable, '-m', 'binderlab._selfcheck'])"
+

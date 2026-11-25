@@ -1,0 +1,47 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+*_venv/
+
+# Testing and coverage
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local databases and runtime artifacts
+*.db
+.binderlab_annotations.db
+*__m*.pdb
+reports_idt/
+BinderMonitor_HITS.csv
+
+# Output from CLI tools runs
+*.fasta
+*_report.csv
+correlaciones_*.png
+correlaciones_*.csv
+scored*.tsv
+
+# Archives
+*.tar.gz
+*.zip
+
+# IDE and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
