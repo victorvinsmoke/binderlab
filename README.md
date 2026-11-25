@@ -51,7 +51,9 @@ binderlab/
 ├── pyproject.toml
 ├── README.md
 ├── LICENSE
+├── CITATION.cff
 ├── .gitignore
+├── .github/workflows/    # Integración continua (GitHub Actions)
 ├── tests/                # Pruebas unitarias automatizadas con pytest
 └── binderlab/
     ├── cli.py            # Despachador de subcomandos CLI
@@ -87,10 +89,10 @@ python -m binderlab._selfcheck
 Si utilizas `binderlab` en tu investigación, por favor cita el repositorio:
  
 ```bibtex
-@software{reche2024binderlab,
+@software{reche2026binderlab,
   author = {Reche Carrascosa, Víctor},
   title = {{binderlab: Suite modular para diseño y monitorización de binders proteicos}},
-  year = {2024},
+  year = {2026},
   url = {https://github.com/victorvinsmoke/binderlab}
 }
 ```

@@ -15,22 +15,10 @@ Organismos: e_coli (default), human, yeast, mouse, b_subtilis
 import argparse
 import csv
 import random
+import re
 import sys
 import warnings
 from pathlib import Path
-
-warnings.filterwarnings("ignore")
-
-# import perezoso. A import-time NO morimos si falta dnachisel;
-# solo falla si de verdad ejecutas este subcomando.
-def _load_deps():
-    global dc, get_codons_table
-    try:
-        import dnachisel as dc
-        from python_codon_tables import get_codons_table
-    except ImportError:
-        sys.exit("Instala dependencias: pip install dnachisel biopython python-codon-tables")
-
 
 dc = None
 get_codons_table = None
@@ -43,15 +31,24 @@ ORGANISMS = {
     "b_subtilis": "b_subtilis_1423",
 }
 
+STANDARD_AA = frozenset("ACDEFGHIKLMNPQRSTVWY")
+
+
+def _load_deps():
+    global dc, get_codons_table
+    try:
+        import dnachisel as _dc
+        from python_codon_tables import get_codons_table as _gct
+        dc, get_codons_table = _dc, _gct
+    except ImportError:
+        sys.exit(
+            "Instala dependencias: pip install '.[dna]' "
+            "(dnachisel biopython python-codon-tables)"
+        )
+
 
 def _min_gc(aa_seq, species):
-    """
-    Calcula el GC mínimo teóricamente alcanzable para esta secuencia y organismo.
-
-    Necesario para secuencias ricas en aminoácidos con codones de alto GC
-    (Ala, Gly, Pro...) donde imponer GC ≤ 60% podría ser imposible.
-    En ese caso, el techo se relaja a min_gc + 4%.
-    """
+    """Calcula el GC mínimo teóricamente alcanzable para esta secuencia y organismo."""
     try:
         table = get_codons_table(species)
         gc = sum(
@@ -66,25 +63,26 @@ def _min_gc(aa_seq, species):
 
 def optimize_for_idt(aa_seq, seq_name="seq", organism="e_coli",
                      max_retries=3, generate_pdf=False, report_dir="reports_idt"):
-    """
-    Optimiza una secuencia de aminoácidos para síntesis en IDT.
-
-    Intenta hasta max_retries veces con distintas semillas aleatorias por si
-    el solver queda atrapado en un mínimo local. Devuelve el primer resultado
-    válido o un dict con 'error' si ningún intento converge.
-    """
-    if dc is None or get_codons_table is None:
-        _load_deps()
-    aa_seq  = aa_seq.upper().strip().rstrip("*")
+    """Optimiza una secuencia de aminoácidos para síntesis en IDT."""
+    aa_seq = "".join(str(aa_seq or "").upper().split()).rstrip("*")
     if not aa_seq:
         return {"dna": None, "error": "Secuencia de aminoácidos vacía."}
+
+    invalid = sorted(set(aa_seq) - STANDARD_AA)
+    if invalid:
+        return {
+            "dna": None,
+            "error": f"Caracteres no válidos en secuencia AA: {', '.join(invalid)}",
+        }
+
+    if dc is None or get_codons_table is None:
+        _load_deps()
+
     species = ORGANISMS.get(organism, organism)
     min_gc_val = _min_gc(aa_seq, species)
     bp = len(aa_seq) * 3
 
-    # Techos de GC: 60% global y 65% local (margen bajo los umbrales IDT)
-    # Se relajan si la composición de la secuencia lo requiere
-    gc_max       = max(0.60, min_gc_val + 0.04)
+    gc_max = max(0.60, min_gc_val + 0.04)
     gc_local_max = max(0.65, min_gc_val + 0.08)
 
     constraints = [
@@ -94,38 +92,34 @@ def optimize_for_idt(aa_seq, seq_name="seq", organism="e_coli",
         dc.AvoidPattern("6xT"),
         dc.AvoidPattern("6xG"),
         dc.AvoidPattern("6xC"),
-        # Ningún 9-mer puede aparecer dos veces en la secuencia completa.
-        # Más estricto que UniquifyAllKmers(k=8) como objetivo: aquí es obligatorio.
         dc.AvoidPattern(dc.RepeatedKmerPattern(n_repeats=2, kmer_size=9)),
     ]
-    # Ventana de GC local solo si la secuencia es suficientemente larga
     if bp >= 100:
         constraints.append(dc.EnforceGCContent(mini=0.25, maxi=gc_local_max, window=100))
     elif bp >= 50:
         constraints.append(dc.EnforceGCContent(mini=0.25, maxi=gc_local_max, window=50))
 
-    for attempt in range(max_retries):
+    safe_name = re.sub(r'[^\w.\-]+', '_', str(seq_name)) or "seq"
+
+    for attempt in range(max(1, int(max_retries))):
         random.seed(42 + attempt * 7)
-
-        problem = dc.DnaOptimizationProblem(
-            sequence=dc.reverse_translate(aa_seq),
-            constraints=constraints,
-            objectives=[
-                # match_codon_usage distribuye entre codones sinónimos según frecuencia,
-                # lo que reduce la aparición de codones idénticos y por tanto repeticiones
-                dc.CodonOptimize(species=species, method="match_codon_usage"),
-                # Penaliza 8-mers repetidos restantes (los de 9+ ya están prohibidos)
-                dc.UniquifyAllKmers(k=8, boost=5.0),
-            ],
-        )
-        problem.max_random_iters = 5000
-
         try:
+            problem = dc.DnaOptimizationProblem(
+                sequence=dc.reverse_translate(aa_seq),
+                constraints=constraints,
+                objectives=[
+                    dc.CodonOptimize(species=species, method="match_codon_usage"),
+                    dc.UniquifyAllKmers(k=8, boost=5.0),
+                ],
+            )
+            problem.max_random_iters = 5000
+
             if generate_pdf:
                 rep_path = Path(report_dir)
                 rep_path.mkdir(exist_ok=True, parents=True)
                 problem.optimize_with_report(
-                    target=str(rep_path / f"{seq_name}_optimization.pdf"))
+                    target=str(rep_path / f"{safe_name}_optimization.pdf")
+                )
             else:
                 problem.resolve_constraints()
                 problem.optimize()
@@ -135,7 +129,7 @@ def optimize_for_idt(aa_seq, seq_name="seq", organism="e_coli",
             return {"dna": None, "error": str(e)}
 
         dna = problem.sequence
-        gc  = (dna.count("G") + dna.count("C")) / len(dna)
+        gc = (dna.count("G") + dna.count("C")) / len(dna)
         return {
             "dna":            dna,
             "gc_pct":         round(gc * 100, 1),
@@ -160,59 +154,71 @@ def _read_input(path, seq_col, name_col):
     suffix = p.suffix.lower()
     if suffix in (".fa", ".fasta", ".faa"):
         entries, name, parts = [], None, []
-        with open(p) as f:
+        with open(p, encoding="utf-8-sig") as f:
             for line in f:
                 line = line.strip()
                 if line.startswith(">"):
                     if name:
                         entries.append((name, "".join(parts)))
-                    name, parts = line[1:].split()[0], []
+                    header = line[1:].strip().split()
+                    name, parts = (header[0] if header else f"seq_{len(entries)}"), []
                 elif line:
                     parts.append(line.upper())
         if name:
             entries.append((name, "".join(parts)))
         return entries
+
     if suffix in (".csv", ".tsv"):
         delimiter = '\t' if suffix == '.tsv' else ','
-        with open(p) as f:
+        with open(p, encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f, delimiter=delimiter)
+            if reader.fieldnames and seq_col not in reader.fieldnames:
+                raise ValueError(
+                    f"Columna '{seq_col}' no encontrada en {p.name}. "
+                    f"Columnas disponibles: {list(reader.fieldnames)}"
+                )
             return [
-                (row.get(name_col, f"seq_{i}"), row.get(seq_col, "").strip().upper())
-                for i, row in enumerate(csv.DictReader(f, delimiter=delimiter))
+                (row.get(name_col) or f"seq_{i}", row.get(seq_col, "").strip().upper())
+                for i, row in enumerate(reader)
                 if row.get(seq_col, "").strip()
             ]
     raise ValueError(f"Formato no reconocido: {p.suffix}. Usa .fasta, .csv o .tsv")
 
 
-def main():
+def main(argv=None):
+    warnings.filterwarnings("ignore", category=UserWarning)
     parser = argparse.ArgumentParser(description="Optimizador de codones para IDT (binderlab dna)")
-    parser.add_argument("-i", "--input",    help="FASTA o CSV de entrada")
+    parser.add_argument("-i", "--input",    help="FASTA, CSV o TSV de entrada")
     parser.add_argument("-o", "--output",   default="optimized", help="Prefijo de salida")
     parser.add_argument("--organism",       default="e_coli", choices=list(ORGANISMS))
-    parser.add_argument("--seq_col",        default="sequence",    help="Columna de secuencia (CSV)")
-    parser.add_argument("--name_col",       default="description", help="Columna de nombre (CSV)")
+    parser.add_argument("--seq_col",        default="sequence",    help="Columna de secuencia (CSV/TSV)")
+    parser.add_argument("--name_col",       default="description", help="Columna de nombre (CSV/TSV)")
     parser.add_argument("--max_retries",    type=int, default=3,   help="Reintentos si no converge")
     parser.add_argument("--single",         metavar="AA_SEQ",      help="Optimizar una secuencia directamente")
     parser.add_argument("--reports",        action="store_true",   help="Generar PDF por secuencia (requiere dnachisel[reports])")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     _load_deps()
 
     print(f"[*] Organismo: {args.organism} ({ORGANISMS[args.organism]})")
 
-    if args.single:
+    if args.single is not None:
         r = optimize_for_idt(args.single, organism=args.organism,
                              max_retries=args.max_retries, generate_pdf=args.reports)
         if r["error"]:
-            print(f"[!] {r['error']}")
-        else:
-            print(f"    GC {r['gc_pct']}%  |  {r['length_bp']} bp  |  traducción: {'OK' if r['translation_ok'] else 'ERROR'}")
-            for i in range(0, len(r["dna"]), 60):
-                print(f"    {r['dna'][i:i+60]}")
-        return
+            sys.exit(f"[!] {r['error']}")
+        print(f"    GC {r['gc_pct']}%  |  {r['length_bp']} bp  |  traducción: {'OK' if r['translation_ok'] else 'ERROR'}")
+        for i in range(0, len(r["dna"]), 60):
+            print(f"    {r['dna'][i:i+60]}")
+        return 0
 
     if not args.input:
         sys.exit("Especifica -i INPUT o --single AA_SEQ")
 
-    sequences = _read_input(args.input, args.seq_col, args.name_col)
+    try:
+        sequences = _read_input(args.input, args.seq_col, args.name_col)
+    except (FileNotFoundError, ValueError) as e:
+        sys.exit(f"[!] {e}")
+
     if not sequences:
         sys.exit(f"[!] No se encontraron secuencias en {args.input}. "
                  f"Revisa el formato o las columnas --seq_col/--name_col.")
@@ -220,6 +226,7 @@ def main():
     if args.reports:
         print("[*] Reportes PDF → ./reports_idt/")
 
+    report_fields = ["dna", "gc_pct", "gc_max_applied", "min_gc_pct", "length_bp", "translation_ok", "error"]
     fasta_rows, csv_rows = [], []
     for i, (name, aa) in enumerate(sequences, 1):
         print(f"  [{i:>4}/{len(sequences)}] {name[:40]:<40}", end=" ", flush=True)
@@ -230,17 +237,16 @@ def main():
         else:
             print(f"GC {r['gc_pct']}%  (máx {r['gc_max_applied']}%, mín posible {r['min_gc_pct']}%)")
             fasta_rows.append((f"{name}_opt", r["dna"]))
-        csv_rows.append({"name": name, "aa_sequence": aa, **{k: r.get(k, "") for k in
-            ["dna", "gc_pct", "gc_max_applied", "min_gc_pct", "length_bp", "translation_ok", "error"]}})
+        csv_rows.append({"name": name, "aa_sequence": aa, **{k: r.get(k, "") for k in report_fields}})
 
     if fasta_rows:
-        with open(f"{args.output}.fasta", "w") as f:
+        with open(f"{args.output}.fasta", "w", encoding="utf-8") as f:
             for name, seq in fasta_rows:
                 f.write(f">{name}\n")
                 for i in range(0, len(seq), 60):
                     f.write(seq[i:i+60] + "\n")
 
-    with open(f"{args.output}_report.csv", "w", newline="") as f:
+    with open(f"{args.output}_report.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(csv_rows[0].keys()))
         writer.writeheader()
         writer.writerows(csv_rows)
@@ -248,6 +254,7 @@ def main():
     errors = sum(1 for r in csv_rows if r.get("error"))
     print(f"\n[+] {len(fasta_rows)}/{len(sequences)} OK  "
           f"({errors} errores)  →  {args.output}.fasta  |  {args.output}_report.csv")
+    return 0
 
 
 if __name__ == "__main__":

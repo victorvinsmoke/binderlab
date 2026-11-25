@@ -10,14 +10,16 @@ Uso:
 """
 
 import argparse
-import pandas as pd
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import importlib.util
+from pathlib import Path
+import re
 import sys
 import time
-from pathlib import Path
 import warnings
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import pandas as pd
 
-warnings.filterwarnings("ignore")
+from binderlab.core.scanner import clean_rosetta_sc_df
 
 # Estado por proceso worker (PyRosetta no es thread-safe).
 # Se instancian en worker_init() y se reutilizan entre PDBs.
@@ -28,8 +30,25 @@ _sap_metric         = None
 _no_relax           = False
 _binder_chain       = 1
 
+_AROMATIC_HYDROPHOBIC = frozenset(('PHE', 'TRP', 'TYR'))
+
+
+def _is_hydrophobic_residue(res):
+    if res.is_apolar():
+        return True
+    name3 = res.name3() if hasattr(res, 'name3') else res.name().split(':', 1)[0]
+    return name3.strip() in _AROMATIC_HYDROPHOBIC
+
+
+def _norm_design_id(name):
+    s = Path(str(name).strip()).name
+    if s.lower().endswith('.pdb'):
+        s = s[:-4]
+    return re.sub(r'_af2pred$', '', s)
+
 
 def worker_init(no_relax_flag, binder_chain=1):
+    warnings.filterwarnings("ignore", category=UserWarning)
     import pyrosetta
     import pyrosetta.rosetta.core.select.residue_selector as res_sel
     import pyrosetta.rosetta.protocols.analysis as analysis
@@ -69,17 +88,17 @@ def interface_pack_min(pose):
     from pyrosetta.rosetta.core.kinematics import MoveMap
     from pyrosetta.rosetta.core.pack.task import TaskFactory
     from pyrosetta.rosetta.core.pack.task.operation import (
-        RestrictToRepacking, OperateOnResidueSubset, PreventRepackingRLT
+        RestrictToRepacking, OperateOnResidueSubset, PreventRepackingRLT,
     )
     from pyrosetta.rosetta.core.select.residue_selector import (
-        NeighborhoodResidueSelector, NotResidueSelector
+        NeighborhoodResidueSelector, NotResidueSelector,
     )
     from pyrosetta.rosetta.protocols.minimization_packing import (
-        PackRotamersMover, MinMover
+        PackRotamersMover, MinMover,
     )
 
     start_binder = pose.conformation().chain_begin(_binder_chain)
-    end_binder   = pose.conformation().chain_end(_binder_chain)
+    end_binder = pose.conformation().chain_end(_binder_chain)
 
     nrs = NeighborhoodResidueSelector()
     nrs.set_focus(f'{start_binder}-{end_binder}')
@@ -89,19 +108,14 @@ def interface_pack_min(pose):
 
     tf = TaskFactory()
     tf.push_back(RestrictToRepacking())
-
-    non_interface_sel = NotResidueSelector(nrs)
-    prevent_op = OperateOnResidueSubset(PreventRepackingRLT(), non_interface_sel)
-    tf.push_back(prevent_op)
+    tf.push_back(OperateOnResidueSubset(PreventRepackingRLT(), NotResidueSelector(nrs)))
 
     packer_task = tf.create_task_and_apply_taskoperations(pose)
-    pack_mover = PackRotamersMover(_scorefxn, packer_task)
-    pack_mover.apply(pose)
+    PackRotamersMover(_scorefxn, packer_task).apply(pose)
 
     mm = MoveMap()
     mm.set_bb(False)
     mm.set_chi(False)
-
     for i in range(1, pose.total_residue() + 1):
         if interface_mask[i]:
             mm.set_chi(i, True)
@@ -112,36 +126,31 @@ def interface_pack_min(pose):
     min_mover.min_type('lbfgs_armijo_nonmonotone')
     min_mover.tolerance(0.01)
     min_mover.apply(pose)
-
     return pose
 
-
-# ==============================================================================
-# FUNCIONES DE ANÁLISIS
-# ==============================================================================
 
 def get_close_residues(pose, distance=10.0):
     """Identifica residuos de interfaz entre el binder y las cadenas de la diana."""
     from pyrosetta.rosetta.core.select.residue_selector import NeighborhoodResidueSelector
 
-    NRS_binder = NeighborhoodResidueSelector()
-    NRS_target = NeighborhoodResidueSelector()
-    NRS_binder.set_distance(distance)
-    NRS_target.set_distance(distance)
+    nrs_binder = NeighborhoodResidueSelector()
+    nrs_target = NeighborhoodResidueSelector()
+    nrs_binder.set_distance(distance)
+    nrs_target.set_distance(distance)
 
     target_chains = [c for c in range(1, pose.num_chains() + 1) if c != _binder_chain]
     start_binder = pose.conformation().chain_begin(_binder_chain)
-    end_binder   = pose.conformation().chain_end(_binder_chain)
+    end_binder = pose.conformation().chain_end(_binder_chain)
 
-    NRS_binder.set_focus(f'{start_binder}-{end_binder}')
-    neighbors_binder = NRS_binder.apply(pose)
+    nrs_binder.set_focus(f'{start_binder}-{end_binder}')
+    neighbors_binder = nrs_binder.apply(pose)
 
     target_ranges = [
         f"{pose.conformation().chain_begin(c)}-{pose.conformation().chain_end(c)}"
         for c in target_chains
     ]
-    NRS_target.set_focus(','.join(target_ranges))
-    neighbors_target = NRS_target.apply(pose)
+    nrs_target.set_focus(','.join(target_ranges))
+    neighbors_target = nrs_target.apply(pose)
 
     close_residues_binder = [
         j for j in range(start_binder, end_binder + 1)
@@ -163,17 +172,15 @@ def compute_rosetta_metrics(pose, interface):
     _interface_analyzer.apply(pose)
 
     data = _interface_analyzer.get_all_data()
-
-    sc       = data.sc_value
-    dsasa    = _interface_analyzer.get_interface_delta_sasa()
-    packstat = _interface_analyzer.get_interface_packstat()
-    hbonds   = data.interface_hbonds
-    ddG      = _interface_analyzer.get_interface_dG()
-
-    unsat_hbonds = _buns_filter.report_sm(pose)
-    sap_score    = _sap_metric.calculate(pose)
-
-    return ddG, sc, dsasa, packstat, hbonds, unsat_hbonds, sap_score
+    return (
+        _interface_analyzer.get_interface_dG(),
+        data.sc_value,
+        _interface_analyzer.get_interface_delta_sasa(),
+        _interface_analyzer.get_interface_packstat(),
+        data.interface_hbonds,
+        _buns_filter.report_sm(pose),
+        _sap_metric.calculate(pose),
+    )
 
 
 def compute_interface_hydrophobicity(pose, close_residues_binder):
@@ -181,10 +188,7 @@ def compute_interface_hydrophobicity(pose, close_residues_binder):
     total = len(close_residues_binder)
     if total == 0:
         return 0.0
-    hydrophobic = sum(
-        1 for i in close_residues_binder
-        if pose.residue(i).is_apolar() or pose.residue(i).name() in ['PHE', 'TRP', 'TYR']
-    )
+    hydrophobic = sum(1 for i in close_residues_binder if _is_hydrophobic_residue(pose.residue(i)))
     return hydrophobic / total
 
 
@@ -198,12 +202,10 @@ def compute_surface_hydrophobicity(pose):
     layer_sel.set_layers(pick_core=False, pick_boundary=False, pick_surface=True)
     surface_mask = layer_sel.apply(binder_pose)
 
-    hydrophobic = 0
-    total       = 0
+    hydrophobic = total = 0
     for i in range(1, len(surface_mask) + 1):
         if surface_mask[i]:
-            res = binder_pose.residue(i)
-            if res.is_apolar() or res.name() in ['PHE', 'TRP', 'TYR']:
+            if _is_hydrophobic_residue(binder_pose.residue(i)):
                 hydrophobic += 1
             total += 1
 
@@ -245,7 +247,7 @@ def score_one_pdb(job):
         pose, f'{ch_binder}_{ch_targets}'
     )
 
-    binder_int_hyd  = compute_interface_hydrophobicity(pose, close_res_binder)
+    binder_int_hyd = compute_interface_hydrophobicity(pose, close_res_binder)
     binder_surf_hyd = compute_surface_hydrophobicity(pose)
 
     print(f"Procesado: {clean_hit} ({time.perf_counter() - t0:.1f}s)")
@@ -265,52 +267,89 @@ def score_one_pdb(job):
     }
 
 
-def main():
+def _merge_af2_scores(rosetta_df, sc_path):
+    """Cruza las métricas de Rosetta con el archivo .sc de AF2 normalizando IDs."""
+    af2_df = clean_rosetta_sc_df(pd.read_table(sc_path, sep=r'\s+', engine='python'))
+
+    necesarias = ['description', 'pae_interaction', 'plddt_total']
+    faltan = [c for c in necesarias if c not in af2_df.columns]
+    if faltan:
+        raise ValueError(
+            f"el .sc no tiene las columnas {faltan}. Encontradas: {list(af2_df.columns)}"
+        )
+
+    af2_df = af2_df[af2_df['description'].notna()].copy()
+    af2_df['pae_interaction'] = pd.to_numeric(af2_df['pae_interaction'], errors='coerce')
+    af2_df['plddt_total'] = pd.to_numeric(af2_df['plddt_total'], errors='coerce')
+    af2_df['pae_plddt_ratio'] = af2_df['pae_interaction'] / (
+        af2_df['plddt_total'].replace(0, float('nan')) / 100
+    )
+
+    rosetta_keyed = rosetta_df.copy()
+    rosetta_keyed['_join_id'] = rosetta_keyed['description'].map(_norm_design_id)
+    af2_keyed = af2_df.copy()
+    af2_keyed['_join_id'] = af2_keyed['description'].map(_norm_design_id)
+    af2_keyed = af2_keyed.drop(columns=['description']).drop_duplicates(subset=['_join_id'])
+
+    merged = pd.merge(rosetta_keyed, af2_keyed, on='_join_id', how='left')
+    return merged.drop(columns=['_join_id'])
+
+
+def main(argv=None):
+    warnings.filterwarnings("ignore", category=UserWarning)
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description=__doc__
+        description=__doc__,
     )
-    parser.add_argument('--pdbdir',   required=True,  help='Directorio con los PDBs')
-    parser.add_argument('--hits',     required=True,  help='Archivo con nombres de diseños')
-    parser.add_argument('--sc',       default='',     help='Archivo *_sorted.sc de AF2')
-    parser.add_argument('--out',      required=True,  help='Archivo de salida (TSV)')
+    parser.add_argument('--pdbdir',   required=True, help='Directorio con los PDBs')
+    parser.add_argument('--hits',     required=True, help='Archivo con nombres de diseños')
+    parser.add_argument('--sc',       default='',    help='Archivo *_sorted.sc de AF2')
+    parser.add_argument('--out',      required=True, help='Archivo de salida (TSV)')
     parser.add_argument('--binder_chain', type=int, default=1,
                         help='Índice de cadena de Rosetta para el binder (1-indexed; por defecto: 1)')
     parser.add_argument('--no_relax', action='store_true', default=False,
                         help='Omitir Pack+Min (ddG menos fiable)')
     parser.add_argument('--workers',  type=int, default=1,
                         help='Procesos paralelos. RAM estimada: ~3 GB/worker. (por defecto: 1)')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    import importlib.util
+    if args.binder_chain < 1:
+        sys.exit("ERROR: --binder_chain debe ser >= 1.")
+    if args.workers < 1:
+        sys.exit("ERROR: --workers debe ser >= 1.")
+
     if importlib.util.find_spec("pyrosetta") is None:
         print("[!] ERROR: 'pyrosetta' no está instalado en este entorno de Python.")
         print("    PyRosetta requiere una licencia de RosettaCommons y no está disponible en PyPI público.")
         print("    Descárgalo e instálalo desde: https://www.pyrosetta.org/downloads")
         sys.exit(1)
 
-    pdb_dir   = Path(args.pdbdir)
+    pdb_dir = Path(args.pdbdir)
     hits_path = Path(args.hits)
 
     if not hits_path.exists():
-        print(f"ERROR: Archivo de hits no encontrado: {args.hits}")
-        sys.exit(1)
+        sys.exit(f"ERROR: Archivo de hits no encontrado: {args.hits}")
 
-    with open(hits_path) as f:
-        hit_names = [hit.strip() for hit in f if hit.strip()]
+    with open(hits_path, encoding='utf-8-sig') as f:
+        hit_names = [
+            line.strip() for line in f
+            if line.strip() and not line.lstrip().startswith('#')
+        ]
 
     jobs = []
     for hit in hit_names:
-        clean = hit.replace('.pdb', '')
-        path  = pdb_dir / f'{clean}.pdb'
-        if path.exists():
-            jobs.append((path, clean))
+        clean = Path(hit).name
+        if clean.lower().endswith('.pdb'):
+            clean = clean[:-4]
+        candidates = [pdb_dir / f'{clean}.pdb', pdb_dir / f'{clean}_af2pred.pdb']
+        found = next((p for p in candidates if p.is_file()), None)
+        if found is not None:
+            jobs.append((found, clean))
         else:
-            print(f"AVISO: {path.name} no encontrado. Saltando.")
+            print(f"AVISO: {clean}.pdb no encontrado en {pdb_dir}. Saltando.")
 
     if not jobs:
-        print("ERROR: Ningún PDB encontrado. Abortando.")
-        sys.exit(1)
+        sys.exit("ERROR: Ningún PDB encontrado. Abortando.")
 
     n_workers = min(args.workers, len(jobs))
 
@@ -331,7 +370,7 @@ def main():
         with ProcessPoolExecutor(
             max_workers=n_workers,
             initializer=worker_init,
-            initargs=(args.no_relax, args.binder_chain)
+            initargs=(args.no_relax, args.binder_chain),
         ) as executor:
             futures = {executor.submit(score_one_pdb, job): job for job in jobs}
             for future in as_completed(futures):
@@ -340,42 +379,24 @@ def main():
                     rows.append(result)
 
     if not rows:
-        print("ERROR: Ningún diseño procesado con éxito.")
-        sys.exit(1)
+        sys.exit("ERROR: Ningún diseño procesado con éxito.")
 
     rosetta_df = pd.DataFrame(rows, columns=[
         'description', 'ddG', 'Shape_complementarity', 'dSASA',
         'Packstat', 'interface_hbonds', 'interface_unsat_hbonds',
-        'SAP', 'binder_int_hyd', 'binder_surf_hyd', 'binder_length'
+        'SAP', 'binder_int_hyd', 'binder_surf_hyd', 'binder_length',
     ])
 
-    if args.sc and Path(args.sc).exists():
-        try:
-            af2_df = pd.read_table(args.sc, sep=r'\s+')
-
-            if 'SCORE:' in af2_df.columns:
-                af2_df = af2_df.drop(columns=['SCORE:'])
-            for etiqueta in ('SCORE_LABEL', 'SCORE'):
-                if etiqueta in af2_df.columns:
-                    af2_df = af2_df.drop(columns=[etiqueta])
-
-            necesarias = ['description', 'pae_interaction', 'plddt_total']
-            faltan = [c for c in necesarias if c not in af2_df.columns]
-            if faltan:
-                raise ValueError(
-                    f"el .sc no tiene las columnas {faltan}. "
-                    f"Encontradas: {list(af2_df.columns)}")
-
-            af2_df = af2_df[af2_df['description'].notna()]
-            af2_df['description'] = af2_df['description'].astype(str)
-
-            af2_df['pae_plddt_ratio'] = af2_df['pae_interaction'] / (
-                af2_df['plddt_total'].replace(0, float('nan')) / 100
-            )
-
-            final_df = pd.merge(rosetta_df, af2_df, on='description', how='left')
-        except Exception as e:
-            print(f"ERROR al procesar .sc de AF2: {e}. Guardando solo métricas de Rosetta.")
+    if args.sc:
+        sc_path = Path(args.sc)
+        if sc_path.is_file():
+            try:
+                final_df = _merge_af2_scores(rosetta_df, sc_path)
+            except Exception as e:
+                print(f"ERROR al procesar .sc de AF2: {e}. Guardando solo métricas de Rosetta.")
+                final_df = rosetta_df
+        else:
+            print(f"AVISO: Archivo --sc no encontrado ({args.sc}). Guardando solo métricas de Rosetta.")
             final_df = rosetta_df
     else:
         print("AVISO: Sin archivo .sc de AF2. Guardando solo métricas de Rosetta.")
@@ -386,8 +407,9 @@ def main():
     final_df.to_csv(args.out, sep='\t', index=False)
 
     elapsed = time.perf_counter() - t0
-    print(f"Completado en {elapsed:.1f}s ({elapsed/len(rows):.1f}s/diseño)")
+    print(f"Completado en {elapsed:.1f}s ({elapsed / len(rows):.1f}s/diseño)")
     print(f"Guardado en: {args.out}")
+    return 0
 
 
 if __name__ == '__main__':

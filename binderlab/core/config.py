@@ -6,6 +6,7 @@ Tenerlo en un objeto explicito permite que los modulos de core/ reciban su
 configuracion por argumento en vez de leerla "del aire", que es lo que hace
 falta para poder repartir el monolito en varios ficheros.
 """
+import copy
 import os
 import json
 from dataclasses import dataclass, field
@@ -120,15 +121,13 @@ def load_pipeline_structure(config_path):
     pasar un JSON parcial (p.ej. solo con "alphafold_dir") sin tener que
     repetir todas las claves.
     """
-    structure = dict(DEFAULT_PIPELINE_STRUCTURE)
+    structure = copy.deepcopy(DEFAULT_PIPELINE_STRUCTURE)
     if not config_path:
         return structure
     # Empaquetado: si no es una ruta existente, probar como nombre de preset
     # incluido en el paquete. Acepta -c complexa y -c complexa.json.
     if not os.path.exists(config_path):
         stem = config_path[:-5] if config_path.endswith('.json') else config_path
-        # Los presets viven en binderlab/presets/, un nivel POR ENCIMA de
-        # core/, porque este modulo ya no esta en la raiz del paquete.
         raiz_paquete = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         preset = os.path.join(raiz_paquete, "presets", f"{stem}.json")
         if os.path.exists(preset):
@@ -138,7 +137,7 @@ def load_pipeline_structure(config_path):
               f"Se usan valores por defecto.")
         return structure
     try:
-        with open(config_path, 'r') as f:
+        with open(config_path, 'r', encoding='utf-8') as f:
             user_config = json.load(f)
         structure.update(user_config)
         print(f"[BinderMonitor] Configuración cargada desde {config_path}")

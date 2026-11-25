@@ -174,3 +174,79 @@ def test_resolve_structure_pdb(tmp_path):
 
     # 4. Inexistente
     assert P.resolve_structure_pdb(str(tmp_path), "no_existe", pl) is None
+
+    # 5. No colisionar prefijos numéricos (design_1 vs design_10)
+    (af_passed / "des_10_af2pred.pdb").write_text("ATOM 10\nEND\n")
+    assert P.resolve_structure_pdb(str(tmp_path), "des_1_dldesign_1", pl) is None
+    (af_passed / "des_1_dldesign_10_af2pred.pdb").write_text("ATOM 10\nEND\n")
+    assert P.resolve_structure_pdb(str(tmp_path), "des_1_dldesign_1", pl) is None
+    (af_passed / "des_3_2_af2pred.pdb").write_text("ATOM 2\nEND\n")
+    assert P.resolve_structure_pdb(str(tmp_path), "des_3", pl) is None
+
+
+def test_trajectory_no_prefix_collision(tmp_path):
+    """get_trajectory_pdb no confunde design_1 con design_10."""
+    rf_dir = tmp_path / "RF_output" / "traj"
+    rf_dir.mkdir(parents=True)
+    (rf_dir / "design_10_pX0_traj.pdb").write_text("MODEL 1\nATOM 1\nENDMDL\n")
+    pl = {
+        "rfdiffusion_dir": "RF_output",
+        "trajectory_subdir": "traj",
+        "trajectory_suffix": "_pX0_traj",
+    }
+    assert P.get_trajectory_pdb(str(tmp_path), "design_1_dldesign_0", pl) is None
+
+
+def test_sc_concatenated_headers_and_numeric(tmp_path):
+    """Archivos .sc concatenados con múltiples cabeceras se limpian sin romper tipos."""
+    sc_path = tmp_path / "concat.sc"
+    sc_path.write_text(
+        "SCORE: pae_interaction plddt_total description\n"
+        "SCORE: 4.5 88.2 des_0_af2pred\n"
+        "SCORE: pae_interaction plddt_total description\n"
+        "SCORE: 6.1 91.0 des_1_af2pred\n"
+    )
+    df = S.parse_metrics_file(str(sc_path), None)
+    assert len(df) == 2
+    assert list(df["base_name"]) == ["des_0", "des_1"]
+    assert pd.api.types.is_numeric_dtype(df["pae_interaction"])
+
+    # Una columna numérica legítima llamada SCORE en un CSV no se descarta
+    csv_score = tmp_path / "docking.csv"
+    csv_score.write_text("description,SCORE\ndes_0,-12.5\n")
+    df_csv = S.parse_metrics_file(str(csv_score), None)
+    assert "SCORE" in df_csv.columns
+    assert float(df_csv["SCORE"].iloc[0]) == -12.5
+
+
+def test_search_literal_contains_and_chained_computed():
+    """contains trata caracteres regex como literales y computed soporta encadenamiento."""
+    df = pd.DataFrame({
+        "a": ["10", "20"],
+        "b": ["2", "5"],
+        "_tags": ["🔬 in vitro+", "🔬 in vitro (pendiente"],
+    })
+    m_plus = Q.apply_rule(df, "_tags", "contains", "🔬 in vitro+")
+    assert list(m_plus) == [True, False]
+
+    # Un paréntesis sin cerrar no debe lanzar re.error
+    m_paren = Q.apply_rule(df, "_tags", "contains", "(pendiente")
+    assert list(m_paren) == [False, True]
+
+    # Columnas computadas encadenadas: c2 depende de c1
+    df_c = Q.apply_computed_columns(df, [
+        {"name": "c1", "expr": "a / b"},
+        {"name": "c2", "expr": "c1 * 10"},
+    ])
+    assert list(df_c["c1"]) == [5.0, 4.0]
+    assert list(df_c["c2"]) == [50.0, 40.0]
+
+    # evaluate_filter_rules ignora valores no numéricos en != igual que en UI
+    mask, _ = Q.evaluate_filter_rules(
+        df_c, ["c1"], ["!="], ["no_num"], ["classic"], [""]
+    )
+    assert list(mask) == [True, True]
+
+    # sort_dataframe ordena numéricamente aunque la columna venga como texto
+    df_sort = Q.sort_dataframe(pd.DataFrame({"x": ["100", "20", "3"]}), "x", True)
+    assert list(df_sort["x"]) == [3, 20, 100]

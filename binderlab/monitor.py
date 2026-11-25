@@ -21,6 +21,7 @@ import atexit
 import shutil
 from datetime import datetime
 import signal
+import threading
 
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -81,11 +82,32 @@ PORT_LABEL = "?"
 TEMP_DIR = None
 
 
+def _get_pipeline():
+    """Devuelve PIPELINE inicializándolo perezosamente con valores por defecto
+    si se invoca desde WSGI (Gunicorn) o tests sin haber pasado por main()."""
+    global PIPELINE
+    if PIPELINE is None:
+        PIPELINE = load_pipeline_structure(None)
+        _init_stages()
+    return PIPELINE
+
+
+def _get_temp_dir():
+    """Devuelve TEMP_DIR creándolo bajo demanda la primera vez que se necesita."""
+    global TEMP_DIR
+    if TEMP_DIR is None:
+        TEMP_DIR = tempfile.mkdtemp(prefix='bindermonitor_')
+    return TEMP_DIR
+
+
+def _exp_label(exp_path, root_path):
+    """Etiqueta legible de un experimento relativa a root_path (evita mostrar '.')."""
+    rel = os.path.relpath(exp_path, root_path) if root_path else exp_path
+    return os.path.basename(os.path.normpath(exp_path)) if rel == '.' else rel
+
+
 def _cleanup_temp_dir():
-    """Borra el directorio temporal al cerrar la app limpiamente.
-    OJO: este hook NO se ejecuta con `kill -9`. Por eso además limpiamos
-    de forma proactiva los frames antiguos al cambiar de diseño en
-    cleanup_old_traj_files()."""
+    """Borra el directorio temporal al cerrar la app limpiamente."""
     if TEMP_DIR and os.path.exists(TEMP_DIR):
         shutil.rmtree(TEMP_DIR, ignore_errors=True)
 
@@ -94,19 +116,11 @@ atexit.register(_cleanup_temp_dir)
 
 
 def cleanup_old_traj_files(keep_basename=None):
-    """Borra los frames temporales que ya no se están usando.
-    Se llama cuando el usuario cambia de diseño en el visor: así no se
-    acumulan archivos en /tmp aunque la app se cierre con kill -9 después.
-
-    Si keep_basename está dado, conserva los frames de ese diseño concreto."""
+    """Borra los frames temporales que ya no se están usando."""
     if not TEMP_DIR:
-        return  # sin tempdir no hay nada que limpiar. Sin esto,
-                # os.listdir(None) listaria el CWD y os.path.join(None,..) petaria.
+        return
     try:
         for f in os.listdir(TEMP_DIR):
-            # Usamos "__m" como separador determinista para no confundir
-            # design_1 con design_10, design_100, etc. Sin el separador,
-            # cualquier diseño que empiece igual se quedaría en /tmp.
             if keep_basename and f.startswith(keep_basename + "__m"):
                 continue
             if f.endswith('.pdb'):
@@ -118,41 +132,31 @@ def cleanup_old_traj_files(keep_basename=None):
         pass
 
 
-# -- Caché del estado HPC ----------------------------------------------------
-# Llamar a `squeue` cada 10 segundos es agresivo y bloquea el thread de Dash
-# si el demonio SLURM está saturado. Cacheamos el resultado durante 30s.
-
-
 # --- Escaneo del filesystem --------------------------------------------------
-# Logica en core/scanner.py, que recibe la configuracion por argumento. Aqui
-# quedan adaptadores con la firma antigua para que los callbacks existentes
-# sigan funcionando sin tocarlos (patron strangler).
 from binderlab.core import scanner as _core_scanner   # noqa: E402
 
 
 def get_experiments(base_dir):
-    return _core_scanner.get_experiments(base_dir, PIPELINE)
+    return _core_scanner.get_experiments(base_dir, _get_pipeline())
 
 
 def get_metric_files(exp_dir):
-    return _core_scanner.get_metric_files(exp_dir, PIPELINE)
+    return _core_scanner.get_metric_files(exp_dir, _get_pipeline())
 
 
 def get_base_name(filename):
-    return _core_scanner.get_base_name(filename, PIPELINE)
+    return _core_scanner.get_base_name(filename, _get_pipeline())
 
 
 def count_funnel_stage(exp_dir, stage_folder, pdb_glob=None):
-    return _core_scanner.count_funnel_stage(exp_dir, stage_folder, PIPELINE, pdb_glob)
+    return _core_scanner.count_funnel_stage(exp_dir, stage_folder, _get_pipeline(), pdb_glob)
 
 
 def parse_metrics_file(metric_file):
-    return _core_scanner.parse_metrics_file(metric_file, PIPELINE)
+    return _core_scanner.parse_metrics_file(metric_file, _get_pipeline())
 
 
 # --- Anotaciones -------------------------------------------------------------
-# Movidas a core/annotations.py (modulo puro). Se reexportan para que los
-# callbacks existentes las sigan encontrando aqui sin cambios.
 from binderlab.core.annotations import (          # noqa: E402
     DEFAULT_TAGS, get_design_annotations, set_design_tags, set_design_note,
     get_all_annotations,
@@ -160,51 +164,35 @@ from binderlab.core.annotations import (          # noqa: E402
 
 
 # --- PDBs --------------------------------------------------------------------
-# La logica vive en core/pdb.py, que recibe la configuracion por argumento.
-# Aqui quedan adaptadores con la firma antigua para que los ~37 callbacks
-# sigan funcionando sin tocarlos (patron strangler: se migran mas adelante).
 from binderlab.core import pdb as _core_pdb           # noqa: E402
-from binderlab.core.pdb import count_pdb_models       # noqa: E402  (no usa config)
+from binderlab.core.pdb import count_pdb_models       # noqa: E402
 
 
 def resolve_structure_pdb(exp_dir, hit_basename):
-    return _core_pdb.resolve_structure_pdb(exp_dir, hit_basename, PIPELINE)
+    return _core_pdb.resolve_structure_pdb(exp_dir, hit_basename, _get_pipeline())
 
 
 def get_trajectory_pdb(exp_dir, base_name):
-    return _core_pdb.get_trajectory_pdb(exp_dir, base_name, PIPELINE)
+    return _core_pdb.get_trajectory_pdb(exp_dir, base_name, _get_pipeline())
 
 
 def logical_to_physical_model(logical_idx, n_models):
-    return _core_pdb.logical_to_physical_model(logical_idx, n_models, PIPELINE)
+    return _core_pdb.logical_to_physical_model(logical_idx, n_models, _get_pipeline())
 
 
 def extract_pdb_model_streaming(pdb_path, model_idx):
-    return _core_pdb.extract_pdb_model_streaming(pdb_path, model_idx, TEMP_DIR)
+    return _core_pdb.extract_pdb_model_streaming(pdb_path, model_idx, _get_temp_dir())
 
 
 def find_experiment_logs(exp_dir, max_results=12):
-    """Localiza archivos de log de forma VERSÁTIL, pensada para servir a
-    laboratorios con pipelines distintos.
-
-    Estrategia (de más específico a más general):
-      1. Busca recursivamente dentro del experimento todos los patrones
-         de `PIPELINE['log_patterns']` (*.log, *.out, *.err...). Esto
-         captura el run_inference.log de RFdiffusion aunque esté enterrado
-         en outputs/FECHA/HORA/.
-      2. Sube por los directorios padre (hasta `log_search_levels`),
-         buscando solo en cada nivel (no recursivo) para capturar
-         wrappers (RFrun_multiple_*.log) y los .out/.err de SLURM que
-         viven en la carpeta del múltiple o en la raíz de campañas.
-
-    Devuelve una lista de rutas ORDENADA por mtime descendente (más
-    reciente primero), deduplicada, recortada a `max_results`. Así el
-    usuario puede elegir cuál ver en lugar de adivinar el monitor.
-    """
+    """Localiza archivos de log recursivamente dentro del experimento y subiendo
+    hasta `log_search_levels` niveles padre (no recursivo), ordenados por
+    relevancia y mtime descendente."""
     if not exp_dir or not os.path.isdir(exp_dir):
         return []
-    patterns = PIPELINE.get('log_patterns', ['*.log', '*.out', '*.err'])
-    levels = int(PIPELINE.get('log_search_levels', 2))
+    pipeline = _get_pipeline()
+    patterns = pipeline.get('log_patterns', ['*.log', '*.out', '*.err'])
+    levels = int(pipeline.get('log_search_levels', 2))
 
     found = set()
 
@@ -322,22 +310,28 @@ def parse_pipeline_state(log_path, exp_dir):
     Estrategia: el log manda para "qué etapa está activa" (marcas [N/M]); el
     disco manda para "cuántos PDBs pasaron/se descartaron". Si no hay log se
     cae con elegancia a solo-disco (estado derivado de los conteos)."""
-    markers   = PIPELINE.get('log_stage_markers', {})
-    prog_pats = PIPELINE.get('log_progress_markers', {})
-    exp_pat   = PIPELINE.get('log_experiment_marker')
-    done_pat  = PIPELINE.get('log_done_marker')
+    pipeline = _get_pipeline()
+    if not STAGE_KEYS:
+        _init_stages()
+    markers   = pipeline.get('log_stage_markers', {})
+    prog_pats = pipeline.get('log_progress_markers', {})
+    exp_pat   = pipeline.get('log_experiment_marker')
+    done_pat  = pipeline.get('log_done_marker')
 
-    re_stage = {k: re.compile(v) for k, v in markers.items() if v}
-    re_prog  = {k: re.compile(v) for k, v in prog_pats.items() if v}
+    re_stage = {k: re.compile(v) for k, v in markers.items()
+                if v and (k in STAGE_KEYS or k == 'postprocess')}
+    re_prog  = {k: re.compile(v) for k, v in prog_pats.items()
+                if v and k in STAGE_KEYS}
     re_exp   = re.compile(exp_pat) if exp_pat else None
     re_done  = re.compile(done_pat) if done_pat else None
-    re_ts     = PIPELINE.get('log_rf_timestep_marker')
+    re_ts     = pipeline.get('log_rf_timestep_marker')
     re_ts     = re.compile(re_ts) if re_ts else None
-    time_pats = PIPELINE.get('log_unit_time_markers', {})
-    re_time   = {k: re.compile(v) for k, v in time_pats.items() if v}
-    stamp_pat = PIPELINE.get('log_timestamp_marker')
+    time_pats = pipeline.get('log_unit_time_markers', {})
+    re_time   = {k: re.compile(v) for k, v in time_pats.items()
+                 if v and k in STAGE_KEYS}
+    stamp_pat = pipeline.get('log_timestamp_marker')
     re_stamp  = re.compile(stamp_pat) if stamp_pat else None
-    rf_t_total = PIPELINE.get('rf_timesteps_total', 50)
+    rf_t_total = pipeline.get('rf_timesteps_total', 50)
 
     state = {
         "experiment": None,
@@ -556,15 +550,12 @@ def parse_pipeline_state(log_path, exp_dir):
                 else:
                     s["status"] = ST_RUNNING
 
-    # Ahora que el status está resuelto, calcular totales esperados.
-    # MPNN total = RF.passed (sólo si RF DONE, porque el filtrado ya ocurrió).
-    # AF total = MPNN.passed (ídem).
-    if state["stages"]["rfdiffusion"]["status"] == ST_DONE:
-        p = state["stages"]["rfdiffusion"]["passed"]
-        state["stages"]["proteinmpnn"]["total"] = p if p > 0 else None
-    if state["stages"]["proteinmpnn"]["status"] == ST_DONE:
-        p = state["stages"]["proteinmpnn"]["passed"]
-        state["stages"]["alphafold"]["total"] = p if p > 0 else None
+    # Totales esperados: el total de cada etapa sucesiva es los `passed` de la
+    # etapa anterior (solo cuando la anterior ya terminó y aplicó su cribado).
+    for prev_k, next_k in zip(order, order[1:]):
+        if state["stages"][prev_k]["status"] == ST_DONE:
+            p = state["stages"][prev_k]["passed"]
+            state["stages"][next_k]["total"] = p if p > 0 else None
 
     # --- Métricas de tiempo de la etapa activa -----------------------------
     # rate_s   = segundos por unidad (media de las últimas muestras).
@@ -850,8 +841,8 @@ from binderlab.core.hpc import get_hpc_status, HPC_TTL_SECONDS   # noqa: E402
 
 # --- Motor de busqueda -------------------------------------------------------
 from binderlab.core.search import (                 # noqa: E402
-    OPERATORS, NUMERIC_OPS, coerce_value, apply_rule, apply_expression,
-    apply_computed_columns, inject_annotation_columns,
+    OPERATORS, apply_computed_columns, inject_annotation_columns,
+    evaluate_filter_rules, sort_dataframe,
 )
 
 
@@ -910,16 +901,23 @@ SIDEBAR_STYLE = {
 MAIN_STYLE = {'width': '76%', 'float': 'right', 'padding': '20px'}
 
 
+def _merge_column_names(columns, computed=None, include_annotations=False):
+    """Combina nombres de columnas reales, computadas y (opcionalmente) anotaciones."""
+    out = list(columns or [])
+    for c in (computed or []):
+        nm = (c or {}).get('name')
+        if nm and nm not in out:
+            out.append(nm)
+    if include_annotations:
+        for extra in ('_tags', '_note'):
+            if extra not in out:
+                out.append(extra)
+    return out
+
+
 def _expr_placeholder(columns):
-    """ejemplo del filtro-expresion derivado del pipeline activo,
-    en vez de un string fijo con nombres de columna de RFdiffusion. Usa las
-    2 primeras radar_metrics (ya saben high/low -> operador correcto); si no
-    hay radar_metrics configuradas, cae a las 2 primeras columnas reales;
-    si tampoco hay datos, cae al ejemplo clasico de RF.
-    Umbral de ejemplo: 0.7/0.3 para metricas 'self_*' (escala 0-1, Complexa),
-    80/10 en otro caso (escala 0-100, RF/Rosetta) -- solo es texto de ayuda,
-    no afecta al filtro real."""
-    radar_metrics = PIPELINE.get('radar_metrics') or RADAR_METRICS
+    """Ejemplo del filtro-expresión derivado del pipeline activo."""
+    radar_metrics = _get_pipeline().get('radar_metrics') or RADAR_METRICS
 
     def thresh(m, sense):
         scale_01 = m.startswith('self_')
@@ -936,31 +934,30 @@ def _expr_placeholder(columns):
     return 'plddt_binder >= 80 and pae_interaction <= 10'
 
 
-def make_rule_row(rule_id, columns):
-    """Construye una fila del motor de búsqueda.
+def make_rule_row(rule, columns):
+    """Construye una fila del motor de búsqueda (modo clásico o expresión)."""
+    if isinstance(rule, dict):
+        rule_id = int(rule['id'])
+        mode = rule.get('mode') or 'classic'
+        col_val = rule.get('col')
+        op_val = rule.get('op') or '>='
+        val_val = '' if rule.get('val') is None else str(rule.get('val'))
+        expr_val = rule.get('expr') or ''
+    else:
+        rule_id = int(rule)
+        mode, col_val, op_val, val_val, expr_val = 'classic', None, '>=', '', ''
 
-    Cada fila tiene DOS modos (m01 — modo expresión):
-      - 'classic': tres widgets (columna + operador + valor), el flujo clásico.
-      - 'expr'   : un único Input de texto libre que se evalúa con df.eval(),
-                   permitiendo aritmética y operadores compuestos en una sola
-                   línea (p.ej. "plddt_binder >= 80 and pae_interaction <= 10").
-
-    El selector de modo y el input de expresión están SIEMPRE en el DOM; se
-    muestran/ocultan con CSS según el modo, de forma que el callback run_search
-    pueda leerlos con el comodín ALL sin que falten componentes.
-
-    El parámetro rule_id es un entero único que se mete en los
-    atributos `id` de cada componente como diccionario:
-        {'type': 'rule-col', 'index': rule_id}
-    Así Dash puede manejarlas todas con un único callback usando
-    el comodín ALL en lugar de un callback por fila."""
+    is_expr = (mode == 'expr')
+    row_flex = {'display': 'flex', 'gap': '8px', 'alignItems': 'center', 'flex': '1'}
     col_options = [{'label': c, 'value': c} for c in (columns or [])]
+    if col_val and col_val not in (columns or []):
+        col_options.append({'label': col_val, 'value': col_val})
+
     return html.Div(
         id={'type': 'rule-row', 'index': rule_id},
         style={'marginBottom': '8px',
                'borderLeft': '3px solid #e0e0e0', 'paddingLeft': '8px'},
         children=[
-            # --- Selector de modo (clásico / expresión) --------------------
             html.Div(
                 style={'display': 'flex', 'alignItems': 'center',
                        'gap': '10px', 'marginBottom': '6px'},
@@ -969,7 +966,7 @@ def make_rule_row(rule_id, columns):
                         id={'type': 'rule-mode', 'index': rule_id},
                         options=[{'label': 'Clásico', 'value': 'classic'},
                                  {'label': 'Expresión', 'value': 'expr'}],
-                        value='classic',
+                        value=mode,
                         inline=True,
                         inputClassName='me-1', labelClassName='me-3',
                         style={'fontSize': '12px'},
@@ -979,7 +976,8 @@ def make_rule_row(rule_id, columns):
                         'sintaxis pandas: and/or, ratios, aritmética',
                         id={'type': 'rule-expr-hint', 'index': rule_id},
                         className='text-muted fst-italic',
-                        style={'fontSize': '11px', 'display': 'none'},
+                        style={'fontSize': '11px',
+                               'display': 'inline' if is_expr else 'none'},
                     ),
                 ],
             ),
@@ -987,27 +985,27 @@ def make_rule_row(rule_id, columns):
             html.Div(
                 style={'display': 'flex', 'gap': '8px', 'alignItems': 'center'},
                 children=[
-                    # --- Widgets del modo CLÁSICO ----------------------------------
                     html.Div(
                         id={'type': 'rule-classic-wrap', 'index': rule_id},
-                        style={'display': 'flex', 'gap': '8px',
-                               'alignItems': 'center', 'flex': '1'},
+                        style={'display': 'none'} if is_expr else row_flex,
                         children=[
                             dcc.Dropdown(
                                 id={'type': 'rule-col', 'index': rule_id},
-                                options=col_options, placeholder='columna...',
+                                options=col_options, value=col_val,
+                                placeholder='columna...',
                                 style={'flex': '2', 'minWidth': '180px'},
                                 persistence=True, persistence_type='session',
                             ),
                             dcc.Dropdown(
                                 id={'type': 'rule-op', 'index': rule_id},
-                                options=OPERATORS, value='>=',
+                                options=OPERATORS, value=op_val,
                                 clearable=False,
                                 style={'flex': '1.2', 'minWidth': '160px'},
                                 persistence=True, persistence_type='session',
                             ),
                             dcc.Input(
                                 id={'type': 'rule-val', 'index': rule_id},
+                                value=val_val,
                                 placeholder='valor...', type='text',
                                 style={'flex': '1', 'minWidth': '110px',
                                        'padding': '6px', 'borderRadius': '4px',
@@ -1017,14 +1015,13 @@ def make_rule_row(rule_id, columns):
                         ],
                     ),
 
-                    # --- Widget del modo EXPRESIÓN ---------------------------------
                     html.Div(
                         id={'type': 'rule-expr-wrap', 'index': rule_id},
-                        style={'display': 'none', 'gap': '8px',
-                               'alignItems': 'center', 'flex': '1'},
+                        style=row_flex if is_expr else {'display': 'none'},
                         children=[
                             dcc.Input(
                                 id={'type': 'rule-expr', 'index': rule_id},
+                                value=expr_val,
                                 placeholder=_expr_placeholder(columns),
                                 type='text',
                                 style={'flex': '1', 'minWidth': '320px',
@@ -1036,7 +1033,6 @@ def make_rule_row(rule_id, columns):
                         ],
                     ),
 
-                    # Botón eliminar regla siempre visible en ambos modos
                     html.Button(
                         html.I(className='bi bi-trash'),
                         id={'type': 'rule-del', 'index': rule_id},
@@ -1050,17 +1046,13 @@ def make_rule_row(rule_id, columns):
 
 
 def serve_layout():
-    """El layout se construye como una FUNCIÓN (no como variable estática)
-    porque queremos que se reescaneé el directorio cada vez que un usuario
-    nuevo abre la página. Si fuera estático, los experimentos se quedarían
-    congelados en los que había al arrancar el script."""
-    experiments = get_experiments(MASTER_DIR_INIT)
+    """Construye el layout dinámicamente al abrir la página para reflejar los
+    experimentos actuales en disco."""
+    master_dir = MASTER_DIR_INIT or os.getcwd()
+    experiments = get_experiments(master_dir)
     return html.Div([
 
-        # ---- Stores: datos invisibles compartidos entre callbacks ----------
-        # Son como variables globales pero "por usuario": cada navegador que
-        # abre la app tiene su propio Store, no se mezclan entre usuarios.
-        dcc.Store(id='master-dir-store', data=MASTER_DIR_INIT),
+        dcc.Store(id='master-dir-store', data=master_dir),
         dcc.Store(id='metrics-cache-store',
                   data={'mtime': 0, 'path': None, 'records': None}),
         dcc.Store(id='available-columns-store', data=[]),
@@ -1092,7 +1084,7 @@ def serve_layout():
             # ---- Directorio raíz dinámico ---------------------------------
             html.H6('Directorio raíz (MASTER_DIR)'),
             dbc.InputGroup([
-                dbc.Input(id='master-dir-input', value=MASTER_DIR_INIT,
+                dbc.Input(id='master-dir-input', value=master_dir,
                           placeholder='/data/.../master_dir', size='sm'),
                 dbc.Button(html.I(className='bi bi-arrow-clockwise'),
                            id='master-dir-reload', color='secondary',
@@ -1106,7 +1098,7 @@ def serve_layout():
             html.H6('Experimento'),
             dcc.Dropdown(
                 id='experiment-dropdown',
-                options=[{'label': os.path.relpath(e, MASTER_DIR_INIT),
+                options=[{'label': _exp_label(e, master_dir),
                           'value': e}
                          for e in experiments],
                 value=experiments[0] if experiments else None,
@@ -1670,7 +1662,7 @@ def reload_experiments(_clicks, _n, dir_value, current_exp):
     if not os.path.isdir(abs_path):
         return no_update, [], None, f"⚠ No existe: {abs_path}"
     exps = get_experiments(abs_path)
-    options = [{'label': os.path.relpath(e, abs_path), 'value': e}
+    options = [{'label': _exp_label(e, abs_path), 'value': e}
                for e in exps]
     new_value = current_exp if current_exp in exps else (exps[0] if exps else None)
     msg = f"✓ {len(exps)} experimento(s) detectados en {abs_path}"
@@ -1712,29 +1704,14 @@ def update_metric_files(exp_dir, _n, current_value):
     Input('metrics-file-dropdown', 'value'),
     Input('polling-interval', 'n_intervals'),
     State('metrics-cache-store', 'data'),
+    State('available-columns-store', 'data'),
 )
-def refresh_metrics_cache(metric_file, _n, cache):
-    """Solo re-lee el archivo si su mtime ha cambiado, y SOLO emite datos
-    nuevos a los Stores cuando realmente han cambiado.
-
-    *** CLAVE PARA EL BUG DE BÚSQUEDA AVANZADA ***
-    Antes, cuando el archivo NO había cambiado, esta función devolvía el
-    cache (y una lista de columnas reconstruida) en CADA polling. Como
-    devolvía objetos nuevos cada 10 s, disparaba en cascada a
-    `update_rule_col_options` (reescribía los dropdowns de las reglas) y a
-    `run_search` (reconstruía la tabla entera), reseteando el operador de
-    las reglas a su valor por defecto y el filtrado/orden nativo de la
-    tabla. Con un run EN MARCHA el mtime cambia constantemente, así que la
-    cascada se repetía sin parar.
-
-    La solución es devolver `no_update` en los dos outputs siempre que no
-    haya un cambio real: así los callbacks de abajo NO se vuelven a
-    ejecutar y la UI deja de resetearse. Cuando aparecen diseños nuevos
-    (mtime cambia de verdad), sí recarga y propaga — que es lo deseable."""
+def refresh_metrics_cache(metric_file, _n, cache, prev_columns):
+    """Solo re-lee el archivo si su mtime cambió y solo actualiza los Stores
+    que realmente han cambiado, evitando cascadas innecesarias en la UI."""
     cache = cache or {'mtime': 0, 'path': None, 'records': None}
 
     if not metric_file or not os.path.exists(metric_file):
-        # Si ya estaba vacío, no re-disparamos; si había algo, lo limpiamos.
         if cache.get('path') is None and cache.get('records') is None:
             return no_update, no_update
         return {'mtime': 0, 'path': None, 'records': None}, []
@@ -1742,19 +1719,14 @@ def refresh_metrics_cache(metric_file, _n, cache):
     try:
         cur_mtime = os.path.getmtime(metric_file)
     except OSError:
-        # Archivo en plena escritura: conservamos TODO sin re-disparar.
         return no_update, no_update
 
-    # Sin cambios → no emitir nada (evita la cascada que reseteaba la UI).
     if (cache.get('path') == metric_file
             and cache.get('mtime', 0) >= cur_mtime
             and cache.get('records') is not None):
         return no_update, no_update
 
     df = parse_metrics_file(metric_file)
-
-    # Lectura a medias (pipeline escribiendo): mantenemos lo viejo sin
-    # re-disparar, para no parpadear a pantalla en blanco.
     if df.empty and cache.get('records'):
         return no_update, no_update
 
@@ -1763,7 +1735,9 @@ def refresh_metrics_cache(metric_file, _n, cache):
         'path': metric_file,
         'records': df.to_dict('records') if not df.empty else [],
     }
-    return new_cache, list(df.columns)
+    new_cols = list(df.columns)
+    cols_out = no_update if new_cols == (prev_columns or []) else new_cols
+    return new_cache, cols_out
 
 
 # ----- 6.4 Poblar dropdowns de ejes con las columnas reales -----------------
@@ -1780,19 +1754,11 @@ def refresh_metrics_cache(metric_file, _n, cache):
     State('yaxis_value', 'value'),
 )
 def populate_axis_dropdowns(columns, computed, cur_x, cur_y):
-    """Las columnas del scatter se descubren del archivo de métricas;
-    no están hardcodeadas. Si están las clásicas (pae_interaction,
-    plddt_binder), se preseleccionan. Las columnas computadas (m09) se
-    añaden al final, disponibles para ordenar."""
+    """Descubre columnas del scatter y de ordenación desde el archivo de métricas."""
     columns = list(columns or [])
     opts = [{'label': c, 'value': c} for c in columns]
-    # Sort dropdown incluye además las columnas computadas
-    sort_cols = list(columns)
-    for c in (computed or []):
-        nm = c.get('name')
-        if nm and nm not in sort_cols:
-            sort_cols.append(nm)
-    sort_opts = [{'label': c, 'value': c} for c in sort_cols]
+    sort_opts = [{'label': c, 'value': c}
+                 for c in _merge_column_names(columns, computed)]
     new_x = cur_x if cur_x in columns else next(
         (c for c in ('pae_interaction', 'self_complex_i_pAE') if c in columns),
         columns[0] if columns else None)
@@ -1848,32 +1814,37 @@ def adapt_filter_ranges(xaxis, yaxis, cache):
     Output('metric-hits', 'children'),
     Output('metric-rate', 'children'),
     Output('hit-dropdown', 'options'),
+    Output('hit-dropdown', 'value'),
     Input('metrics-cache-store', 'data'),
     Input('filter-pae', 'value'),
     Input('filter-plddt', 'value'),
     Input('xaxis_value', 'value'),
     Input('yaxis_value', 'value'),
     Input('color_value', 'value'),
+    State('hit-dropdown', 'value'),
 )
-def update_dashboard(cache, xthr, ythr, xaxis, yaxis, color_col):
+def update_dashboard(cache, xthr, ythr, xaxis, yaxis, color_col, cur_hit):
     """Refresca el scatter, las tarjetas de métricas y la lista de diseños
-    seleccionables en el visor. Los dos umbrales se aplican a las columnas
-    elegidas en los ejes: X por arriba (<=), Y por abajo (>=). Así el filtro
-    funciona con cualquier métrica, no solo pae/plddt."""
+    seleccionables en el visor."""
     records = (cache or {}).get('records') or []
     if not records:
-        return go.Figure(), "0", "0", "0%", []
+        return go.Figure(), "0", "0", "0%", [], (None if cur_hit else no_update)
     df = pd.DataFrame(records)
     if xaxis not in df.columns or yaxis not in df.columns:
-        return go.Figure(), str(len(df)), "—", "—", []
+        return go.Figure(), str(len(df)), "—", "—", [], (None if cur_hit else no_update)
 
-    # umbral X (<=) y umbral Y (>=) sobre las columnas elegidas.
-    # Para labs RF los ejes por defecto son pae/plddt -> mismo comportamiento.
+    x_num = pd.to_numeric(df[xaxis], errors='coerce')
+    y_num = pd.to_numeric(df[yaxis], errors='coerce')
+    if x_num.notna().any():
+        df[xaxis] = x_num
+    if y_num.notna().any():
+        df[yaxis] = y_num
+
     mask = pd.Series(True, index=df.index)
     if xthr is not None:
-        mask &= pd.to_numeric(df[xaxis], errors='coerce') <= xthr
+        mask &= x_num <= xthr
     if ythr is not None:
-        mask &= pd.to_numeric(df[yaxis], errors='coerce') >= ythr
+        mask &= y_num >= ythr
     df['is_hit'] = mask
 
     total = len(df)
@@ -1882,6 +1853,9 @@ def update_dashboard(cache, xthr, ythr, xaxis, yaxis, color_col):
 
     hover_cols = [c for c in ('description', 'base_name') if c in df.columns]
     if color_col and color_col in df.columns:
+        c_num = pd.to_numeric(df[color_col], errors='coerce')
+        if c_num.notna().sum() >= df[color_col].notna().sum():
+            df[color_col] = c_num
         fig = px.scatter(df, x=xaxis, y=yaxis, color=color_col,
                          hover_data=hover_cols,
                          marginal_x='violin', marginal_y='violin',
@@ -1894,15 +1868,17 @@ def update_dashboard(cache, xthr, ythr, xaxis, yaxis, color_col):
     fig.update_layout(margin=dict(l=20, r=20, t=20, b=20),
                       transition_duration=300)
 
-    # Lista de diseños seleccionables en el visor 3D
     if 'base_name' in df.columns:
+        all_names = set(df['base_name'].dropna())
         hit_options = [
             {'label': bn, 'value': bn}
             for bn in df.loc[mask, 'base_name'].dropna().unique()
         ]
+        next_hit = None if (cur_hit and cur_hit not in all_names) else no_update
     else:
         hit_options = []
-    return fig, str(total), str(hits), rate, hit_options
+        next_hit = None if cur_hit else no_update
+    return fig, str(total), str(hits), rate, hit_options, next_hit
 
 
 # ----- 6.6 Pipeline tracking: funnel + opciones de log ----------------------
@@ -1921,6 +1897,9 @@ def update_pipeline(exp_dir, _n, current_log):
     `update_log_viewer` según lo que el usuario elija en el dropdown."""
     if not exp_dir:
         return go.Figure(), [], None
+    _get_pipeline()
+    if not STAGE_KEYS:
+        _init_stages()
 
     fc = {k: count_funnel_stage(exp_dir, STAGE_DIRS[k], STAGE_GLOBS[k])
           for k in STAGE_KEYS}
@@ -1932,7 +1911,6 @@ def update_pipeline(exp_dir, _n, current_log):
 
     all_totals = [fc[k][0] for k in STAGE_KEYS]
     if all(v == 0 for v in all_totals):
-        # Nada contabilizado todavía.
         fig = go.Figure()
         fig.add_annotation(
             text="Pipeline en ejecución — aún no hay PDBs contabilizados",
@@ -1941,9 +1919,7 @@ def update_pipeline(exp_dir, _n, current_log):
         fig.update_layout(margin=dict(l=20, r=20, t=30, b=20),
                           xaxis=dict(visible=False), yaxis=dict(visible=False))
     else:
-        # Embudo de retención: cada barra = supervivientes de la etapa.
-        # "percent previous" comunica la tasa de retención etapa a etapa,
-        # que es justo lo que mide un pipeline de cribado.
+        x_max = max(max(survivors, default=0), 1)
         fig = go.Figure(go.Funnel(
             y=stages,
             x=survivors,
@@ -1955,12 +1931,11 @@ def update_pipeline(exp_dir, _n, current_log):
                            "<br>Retención vs etapa previa: "
                            "%{percentPrevious:.0%}<extra></extra>"),
         ))
-        # Anotar los descartados de cada etapa a la derecha de su barra.
-        for i, (st, dsc, surv) in enumerate(zip(stages, discarded, survivors)):
+        for st, dsc, surv in zip(stages, discarded, survivors):
             if dsc > 0:
                 rate = dsc / (surv + dsc) if (surv + dsc) else 0
                 fig.add_annotation(
-                    x=max(survivors) * 1.02, y=st, xanchor='left',
+                    x=x_max * 1.02, y=st, xanchor='left',
                     text=f"<span style='color:#C0392B'>✕ {dsc} descartados "
                          f"({rate:.0%})</span>",
                     showarrow=False, font=dict(size=11))
@@ -1968,7 +1943,7 @@ def update_pipeline(exp_dir, _n, current_log):
             margin=dict(l=20, r=140, t=30, b=20),
             funnelmode="stack",
             showlegend=False,
-            xaxis=dict(range=[0, max(survivors) * 1.35]),
+            xaxis=dict(range=[0, x_max * 1.35]),
         )
 
     # --- Lista versátil de logs (recursiva + niveles padre) -------------
@@ -2086,31 +2061,64 @@ def update_hpc(_clicks, _n):
     Input({'type': 'rule-del', 'index': ALL}, 'n_clicks'),
     State('rules-store', 'data'),
     State('rules-counter-store', 'data'),
+    State({'type': 'rule-row', 'index': ALL}, 'id'),
+    State({'type': 'rule-mode', 'index': ALL}, 'value'),
+    State({'type': 'rule-col', 'index': ALL}, 'value'),
+    State({'type': 'rule-op', 'index': ALL}, 'value'),
+    State({'type': 'rule-val', 'index': ALL}, 'value'),
+    State({'type': 'rule-expr', 'index': ALL}, 'value'),
     prevent_initial_call=True,
 )
-def manage_rules(_add_n, _clear_n, _del_clicks, rules, counter):
-    """Gestiona el ciclo de vida de las reglas: añadir, limpiar, eliminar.
-    `ctx.triggered_id` indica qué botón disparó el callback."""
-    rules = list(rules or [])
+def manage_rules(_add_n, _clear_n, _del_clicks, rules, counter,
+                 row_ids=None, modes=None, cols=None, ops=None, vals=None, exprs=None):
+    """Gestiona el ciclo de vida de las reglas preservando los valores editados."""
+    from itertools import zip_longest
+
+    live_by_id = {}
+    for rid, mode, col, op, val, expr in zip_longest(
+            row_ids or [], modes or [], cols or [], ops or [], vals or [], exprs or []):
+        if isinstance(rid, dict) and 'index' in rid:
+            idx = int(rid['index'])
+            live_by_id[idx] = {
+                'id': idx,
+                'mode': mode or 'classic',
+                'col': col,
+                'op': op or '>=',
+                'val': '' if val is None else str(val),
+                'expr': expr or '',
+            }
+
+    norm_rules = []
+    for r in (rules or []):
+        rid = int(r['id']) if isinstance(r, dict) else int(r)
+        if rid in live_by_id:
+            norm_rules.append(live_by_id[rid])
+        elif isinstance(r, dict):
+            norm_rules.append(r)
+        else:
+            norm_rules.append({
+                'id': rid, 'mode': 'classic', 'col': None, 'op': '>=', 'val': '', 'expr': '',
+            })
+
     counter = int(counter or 0)
     triggered = ctx.triggered_id
 
     if triggered == 'add-rule-btn':
-        rules.append(counter)
-        counter += 1
-        return rules, counter
+        norm_rules.append({
+            'id': counter, 'mode': 'classic', 'col': None, 'op': '>=', 'val': '', 'expr': '',
+        })
+        return norm_rules, counter + 1
 
     if triggered == 'clear-rules-btn':
         return [], counter
 
-    # Si fue uno de los botones "borrar" de una fila concreta:
     if isinstance(triggered, dict) and triggered.get('type') == 'rule-del':
         if not any(_del_clicks or []):
             raise PreventUpdate
-        idx = triggered.get('index')
-        return [r for r in rules if r != idx], counter
+        del_idx = int(triggered.get('index'))
+        return [r for r in norm_rules if int(r['id']) != del_idx], counter
 
-    return rules, counter
+    return norm_rules, counter
 
 
 # ----- m09: gestión de columnas computadas ----------------------------------
@@ -2127,29 +2135,27 @@ def manage_rules(_add_n, _clear_n, _del_clicks, rules, counter):
     prevent_initial_call=True,
 )
 def add_computed_column(_n, name, expr, computed, cache):
-    """Valida y registra una columna computada nueva. La expresión se
-    prueba contra el dataset actual antes de aceptarla, para dar feedback
-    inmediato si referencia una columna inexistente o tiene un error."""
-    computed = list(computed or [])
+    """Valida y registra una columna computada nueva (soportando encadenamiento)."""
+    computed = [c for c in (computed or []) if c.get('name')]
     if not name or not str(name).strip() or not expr or not str(expr).strip():
         return no_update, "✕ Indica nombre y expresión.", no_update, no_update
     name = str(name).strip()
+    expr = str(expr).strip()
 
-    # Validar contra el dataset actual
+    prev = [c for c in computed if c.get('name') != name]
+    candidate_list = prev + [{'name': name, 'expr': expr}]
+
     records = (cache or {}).get('records') or []
     if records:
         df = pd.DataFrame(records)
-        test = apply_computed_columns(df, [{'name': name, 'expr': expr}])
+        test = apply_computed_columns(df, candidate_list)
         if name not in test.columns:
             return (no_update,
-                    "✕ La expresión falló (¿columna inexistente?). No añadida.",
+                    "✕ La expresión falló (¿columna inexistente o no permitida?). No añadida.",
                     no_update, no_update)
 
-    # Reemplazar si ya existía una con ese nombre
-    computed = [c for c in computed if c.get('name') != name]
-    computed.append({'name': name, 'expr': str(expr).strip()})
     msg = f"✓ Columna '{name}' añadida. Ya es filtrable y ordenable."
-    return computed, msg, '', ''
+    return candidate_list, msg, '', ''
 
 
 # ----- m03: poblar el selector del explorador de umbrales -------------------
@@ -2159,14 +2165,8 @@ def add_computed_column(_n, name, expr, computed, cache):
     Input('computed-cols-store', 'data'),
 )
 def populate_threshold_col(columns, computed):
-    """Ofrece todas las columnas (reales + computadas) para explorar
-    su distribución y percentiles."""
-    columns = list(columns or [])
-    for c in (computed or []):
-        nm = c.get('name')
-        if nm and nm not in columns:
-            columns.append(nm)
-    return [{'label': c, 'value': c} for c in columns]
+    """Ofrece todas las columnas (reales + computadas) para explorar su distribución."""
+    return [{'label': c, 'value': c} for c in _merge_column_names(columns, computed)]
 
 
 # ----- m03: histograma con marcas de percentil ------------------------------
@@ -2222,14 +2222,17 @@ def render_threshold_hist(col, cache, computed):
     Output('rules-container', 'children'),
     Input('rules-store', 'data'),
     State('available-columns-store', 'data'),
+    State('computed-cols-store', 'data'),
+    State('annotations-store', 'data'),
 )
-def render_rules(rules, columns):
+def render_rules(rules, columns, computed=None, annotations=None):
     """Renderiza las filas de reglas a partir del estado en rules-store."""
     rules = rules or []
     if not rules:
         return html.P('Pulsa "Añadir regla" para empezar a filtrar.',
                       className='text-muted fst-italic')
-    return [make_rule_row(r, columns) for r in rules]
+    all_cols = _merge_column_names(columns, computed, include_annotations=bool(annotations))
+    return [make_rule_row(r, all_cols) for r in rules]
 
 
 # ----- m01: alternar visibilidad clásico/expresión por fila -----------------
@@ -2241,20 +2244,14 @@ def render_rules(rules, columns):
     prevent_initial_call=True,
 )
 def toggle_rule_mode(modes):
-    """Muestra los widgets del modo elegido y oculta los del otro.
-    Se dispara cuando el usuario cambia el RadioItems de cualquier fila."""
+    """Muestra los widgets del modo elegido y oculta los del otro."""
     classic_styles, expr_styles, hint_styles = [], [], []
+    row_flex = {'display': 'flex', 'gap': '8px', 'alignItems': 'center', 'flex': '1'}
     for mode in (modes or []):
         is_expr = (mode == 'expr')
-        classic_styles.append(
-            {'display': 'none'} if is_expr
-            else {'display': 'flex', 'gap': '8px', 'alignItems': 'center', 'flex': '1'})
-        expr_styles.append(
-            {'display': 'flex', 'gap': '8px', 'alignItems': 'center', 'flex': '1'} if is_expr
-            else {'display': 'none'})
-        hint_styles.append(
-            {'fontSize': '11px', 'display': 'inline'} if is_expr
-            else {'fontSize': '11px', 'display': 'none'})
+        classic_styles.append({'display': 'none'} if is_expr else row_flex)
+        expr_styles.append(row_flex if is_expr else {'display': 'none'})
+        hint_styles.append({'fontSize': '11px', 'display': 'inline' if is_expr else 'none'})
     return classic_styles, expr_styles, hint_styles
 
 
@@ -2267,21 +2264,16 @@ def toggle_rule_mode(modes):
     prevent_initial_call=True,
 )
 def update_rule_col_options(columns, computed, annotations, ids):
-    """Cuando cambia el archivo de métricas, se añade una columna
-    computada (m09) o hay anotaciones (m06), refresca las opciones de
-    columna en TODAS las reglas existentes (no solo en las nuevas)."""
-    columns = list(columns or [])
-    for c in (computed or []):
-        nm = c.get('name')
-        if nm and nm not in columns:
-            columns.append(nm)
-    # Columnas de anotación filtrables (m06)
-    if annotations:
-        for extra in ('_tags', '_note'):
-            if extra not in columns:
-                columns.append(extra)
-    opts = [{'label': c, 'value': c} for c in columns]
+    """Refresca las opciones de columna en todas las reglas existentes."""
+    all_cols = _merge_column_names(columns, computed, include_annotations=bool(annotations))
+    opts = [{'label': c, 'value': c} for c in all_cols]
     return [opts] * len(ids)
+
+
+def _prepare_search_df(records, computed, annotations):
+    df = pd.DataFrame(records)
+    df = apply_computed_columns(df, computed)
+    return inject_annotation_columns(df, annotations)
 
 
 @callback(
@@ -2301,128 +2293,21 @@ def update_rule_col_options(columns, computed, annotations, ids):
 )
 def run_search(cache, cols, ops, vals, modes, exprs, computed, annotations,
                sort_by, sort_asc):
-    """Aplica las reglas en orden y devuelve la tabla de resultados.
-
-    Cada regla puede estar en modo 'classic' (col/op/val) o 'expr'
-    (una expresión pandas evaluada con df.eval — m01). Las columnas
-    computadas (m09) y las anotaciones (_tags/_note, m06) se añaden antes
-    de filtrar, así son filtrables como cualquier otra.
-
-    Toda la tabla se entrega al frontend (Dash maneja la paginación
-    nativamente); no se trunca. Truncar aquí ocultaría el mejor diseño
-    si por azar quedó en la fila 600."""
+    """Aplica las reglas en orden y devuelve la tabla paginada de resultados."""
     records = (cache or {}).get('records') or []
     if not records:
         return (html.P('Sin datos. Selecciona un archivo de métricas válido.',
                        className='text-muted'),
                 "—", "")
-    df = pd.DataFrame(records)
-    df = apply_computed_columns(df, computed)
-    df = inject_annotation_columns(df, annotations)
+    df = _prepare_search_df(records, computed, annotations)
     total_initial = len(df)
-    funnel_lines = [f"[*] Iniciales: {total_initial}"]
-    mask_global = pd.Series(True, index=df.index)
+    mask_global, funnel_lines = evaluate_filter_rules(df, cols, ops, vals, modes, exprs)
 
-    # Normalizar las listas paralelas (pueden venir con longitudes distintas
-    # durante un re-render parcial). zip_longest evita IndexError.
-    from itertools import zip_longest
-    cols = cols or []
-    ops = ops or []
-    vals = vals or []
-    modes = modes or []
-    exprs = exprs or []
-
-    for col, op, val, mode, expr in zip_longest(cols, ops, vals, modes, exprs):
-        # --- Modo EXPRESIÓN (m01) --------------------------------------
-        if mode == 'expr':
-            if not expr or not str(expr).strip():
-                continue
-            m, err = apply_expression(df, expr)
-            if err:
-                funnel_lines.append(
-                    f"  [!] expr «{expr}» → {err}. Regla ignorada.")
-                continue
-            before = int(mask_global.sum())
-            mask_global = mask_global & m
-            survivors = int(mask_global.sum())
-            funnel_lines.append(
-                f"  → expr «{expr}»   supervivientes: {survivors}")
-            if survivors == 0 and before > 0:
-                funnel_lines.append(
-                    "     ⚠ 0 supervivientes tras esta expresión.")
-            elif before > 0 and survivors / before < 0.05:
-                pct = 100 * (1 - survivors / before)
-                funnel_lines.append(
-                    f"     ⚠ esta expresión eliminó el {pct:.0f}% restante.")
-            continue
-
-        # --- Modo CLÁSICO ----------------------------------------------
-        if not col or not op or val is None or val == '':
-            continue
-        coerced = coerce_value(op, val)
-        if op in NUMERIC_OPS and coerced is None:
-            funnel_lines.append(
-                f"  [!] [{col} {op} {val}] → valor no numérico, regla ignorada.")
-            continue
-        m = apply_rule(df, col, op, coerced)
-        if m is None:
-            funnel_lines.append(
-                f"  [!] [{col} {op} {val}] → operador no aplicable, regla ignorada.")
-            continue
-        before = int(mask_global.sum())
-        mask_global = mask_global & m.fillna(False)
-        survivors = int(mask_global.sum())
-        funnel_lines.append(
-            f"  → [{col} {op} {val}]   supervivientes: {survivors}")
-
-        # --- Diagnóstico de filtros catastróficos --------------------------
-        # Si una regla deja 0 (o casi 0) supervivientes, avisamos y sugerimos
-        # un umbral razonable basado en los percentiles del dataset actual.
-        col_num = pd.to_numeric(df[col], errors='coerce')
-        if survivors == 0 and before > 0:
-            if op in ('>=', '>') and col_num.notna().any():
-                sug = round(float(col_num.quantile(0.10)), 3)
-                funnel_lines.append(
-                    f"     ⚠ 0 supervivientes. Máximo de '{col}' = "
-                    f"{col_num.max():.3g}. Prueba con ≥ {sug} (p10).")
-            elif op in ('<=', '<') and col_num.notna().any():
-                sug = round(float(col_num.quantile(0.90)), 3)
-                funnel_lines.append(
-                    f"     ⚠ 0 supervivientes. Mínimo de '{col}' = "
-                    f"{col_num.min():.3g}. Prueba con ≤ {sug} (p90).")
-            else:
-                funnel_lines.append(
-                    "     ⚠ 0 supervivientes tras esta regla. Revisa el valor.")
-        elif before > 0 and survivors / before < 0.05:
-            pct = 100 * (1 - survivors / before)
-            funnel_lines.append(
-                f"     ⚠ esta regla eliminó el {pct:.0f}% de los diseños "
-                f"que quedaban. ¿Umbral demasiado estricto?")
-
-    df_hits = df[mask_global].copy()
-    if sort_by and sort_by in df_hits.columns:
-        # Ordenar numéricamente si la columna es convertible; si no, se deja
-        # tal cual. (Antes se usaba errors='ignore', deprecado en pandas.)
-        try:
-            df_hits[sort_by] = pd.to_numeric(df_hits[sort_by])
-        except (ValueError, TypeError):
-            pass
-        df_hits = df_hits.sort_values(by=sort_by,
-                                      ascending=bool(sort_asc),
-                                      na_position='last')
+    df_hits = sort_dataframe(df[mask_global], sort_by, sort_asc)
     n_hits = len(df_hits)
     rate = (n_hits / total_initial * 100) if total_initial else 0
-    summary = (f"{total_initial} iniciales → {n_hits} supervivientes "
-               f"({rate:.2f} %)")
+    summary = f"{total_initial} iniciales → {n_hits} supervivientes ({rate:.2f} %)"
 
-    # OJO: aquí NO se trunca la tabla. Dash maneja la paginación nativamente
-    # con `page_size`, así que pasar 10.000 filas es perfectamente seguro.
-    # Recortar a head(N) ocultaría diseños buenos al investigador.
-    #
-    # persistence=True + id fijo ('search-table'): aunque este callback
-    # reconstruya la tabla (p.ej. al llegar diseños nuevos de un run en
-    # marcha), Dash RESTAURA el filtrado/orden/página nativos que tuviera
-    # el usuario. Sin esto, cada recarga vaciaba esos filtros.
     table = dash_table.DataTable(
         id='search-table',
         data=df_hits.to_dict('records'),
@@ -2446,29 +2331,6 @@ def run_search(cache, cols, ops, vals, modes, exprs, computed, annotations,
     return table, summary, html.Pre("\n".join(funnel_lines))
 
 
-def _build_filter_mask(df, cols, ops, vals, modes, exprs):
-    """Construye la máscara global aplicando todas las reglas (clásicas y de
-    expresión). Helper compartido por export_csv y la exportación de manifest
-    para no duplicar la lógica de filtrado."""
-    from itertools import zip_longest
-    mask = pd.Series(True, index=df.index)
-    for col, op, val, mode, expr in zip_longest(
-            cols or [], ops or [], vals or [], modes or [], exprs or []):
-        if mode == 'expr':
-            if expr and str(expr).strip():
-                m, _ = apply_expression(df, expr)
-                if m is not None:
-                    mask &= m
-            continue
-        if not col or not op or val is None or val == '':
-            continue
-        coerced = coerce_value(op, val)
-        m = apply_rule(df, col, op, coerced)
-        if m is not None:
-            mask &= m.fillna(False)
-    return mask
-
-
 @callback(
     Output('download-csv', 'data'),
     Input('export-csv-btn', 'n_clicks'),
@@ -2485,25 +2347,14 @@ def _build_filter_mask(df, cols, ops, vals, modes, exprs):
     prevent_initial_call=True,
 )
 def export_csv(_n, cache, cols, ops, vals, modes, exprs, computed, annotations, sort_by, sort_asc):
-    """Exporta todos los hits del filtro actual a un CSV. Es el equivalente
-    UI del flag `-o HITS_ELITE.csv` de extract_hits.py."""
+    """Exporta todos los hits del filtro actual a un CSV."""
     records = (cache or {}).get('records') or []
     if not records:
         raise PreventUpdate
-    df = pd.DataFrame(records)
-    df = apply_computed_columns(df, computed)
-    df = inject_annotation_columns(df, annotations)
-    mask = _build_filter_mask(df, cols, ops, vals, modes, exprs)
-    df_out = df[mask].copy()
-    if sort_by and sort_by in df_out.columns:
-        try:
-            df_out[sort_by] = pd.to_numeric(df_out[sort_by])
-        except (ValueError, TypeError):
-            pass
-        df_out = df_out.sort_values(by=sort_by, ascending=bool(sort_asc),
-                                    na_position='last')
-    return dcc.send_data_frame(df_out.to_csv,
-                               "BinderMonitor_HITS.csv", index=False)
+    df = _prepare_search_df(records, computed, annotations)
+    mask, _ = evaluate_filter_rules(df, cols, ops, vals, modes, exprs)
+    df_out = sort_dataframe(df[mask], sort_by, sort_asc)
+    return dcc.send_data_frame(df_out.to_csv, "BinderMonitor_HITS.csv", index=False)
 
 
 # ----- m04: exportar manifest (estado serializable del filtrado) ------------
@@ -2561,20 +2412,15 @@ def export_manifest(_n, cols, ops, vals, modes, exprs, computed,
     Output('sort-by-dropdown', 'value', allow_duplicate=True),
     Output('sort-asc-switch', 'value', allow_duplicate=True),
     Output('manifest-feedback', 'children'),
+    Output('manifest-upload', 'contents'),
     Input('manifest-upload', 'contents'),
     State('manifest-upload', 'filename'),
+    State('rules-counter-store', 'data'),
     prevent_initial_call=True,
 )
-def load_manifest(contents, filename):
-    """Lee un manifest.json arrastrado y restaura reglas, columnas
-    computadas y orden. Las reglas se recrean como índices nuevos en
-    rules-store; los valores concretos los recoge la persistencia de
-    sesión y el propio render. Como el contenido detallado de cada regla
-    se guarda en componentes (no en rules-store), aquí solo recreamos el
-    número de filas necesario y dejamos que el usuario las repueble; para
-    una restauración fiel de valores se requiere el patrón de stores por
-    regla. Restauramos de forma fiel lo que SÍ vive en stores: columnas
-    computadas y orden."""
+def load_manifest(contents, filename, counter=0):
+    """Lee un manifest.json arrastrado y restaura fielmente reglas (clásicas y
+    expresiones), columnas computadas y criterio de ordenación."""
     if not contents:
         raise PreventUpdate
     try:
@@ -2583,23 +2429,42 @@ def load_manifest(contents, filename):
         manifest = json.loads(base64.b64decode(b64).decode('utf-8'))
     except Exception as e:
         return (no_update, no_update, no_update, no_update, no_update,
-                f"✕ Error leyendo manifest: {e}")
+                f"✕ Error leyendo manifest: {e}", None)
 
     filters = manifest.get('filters', []) or []
     computed = manifest.get('computed_columns', []) or []
     sort_by = manifest.get('sort_by', no_update)
     sort_asc = manifest.get('sort_ascending', no_update)
 
-    # Recrear tantas filas como filtros (índices 0..N-1). El detalle de
-    # cada filtro se aplica vía persistencia/recarga del usuario.
-    n = len(filters)
-    rules = list(range(n)) if n else []
-    counter = n
+    next_id = int(counter or 0)
+    rules = []
+    for item in filters:
+        if not isinstance(item, dict):
+            continue
+        if item.get('mode') == 'expr':
+            rules.append({
+                'id': next_id,
+                'mode': 'expr',
+                'col': None,
+                'op': '>=',
+                'val': '',
+                'expr': str(item.get('expresion') or ''),
+            })
+        else:
+            val_raw = item.get('valor')
+            rules.append({
+                'id': next_id,
+                'mode': 'classic',
+                'col': item.get('columna'),
+                'op': item.get('operador') or '>=',
+                'val': '' if val_raw is None else str(val_raw),
+                'expr': '',
+            })
+        next_id += 1
 
-    msg = (f"✓ Cargado '{filename}': {n} reglas, "
-           f"{len(computed)} columnas computadas. "
-           f"Revisa/ajusta los valores de las reglas restauradas.")
-    return rules, counter, computed, sort_by, sort_asc, msg
+    msg = (f"✓ Cargado '{filename}': {len(rules)} regla(s), "
+           f"{len(computed)} columna(s) computada(s).")
+    return rules, next_id, computed, sort_by, sort_asc, msg, None
 
 
 # =============================================================================
@@ -2619,6 +2484,19 @@ def load_manifest(contents, filename):
 #   C) update_traj_label — etiqueta "MODEL X / N" al mover slider
 # =============================================================================
 
+def _unpack_traj_store(traj_store):
+    """Extrae `(pdb_path, n_models)` de `traj-pdb-store` (dict o ruta str legada)."""
+    if isinstance(traj_store, dict):
+        pdb_path = traj_store.get('pdb')
+        n_models = int(traj_store.get('n_models') or 0)
+        if pdb_path and n_models <= 0:
+            n_models = count_pdb_models(pdb_path)
+        return pdb_path, n_models
+    if isinstance(traj_store, str) and traj_store:
+        return traj_store, count_pdb_models(traj_store)
+    return None, 0
+
+
 @callback(
     Output('traj-pdb-store', 'data'),
     Output('traj-slider', 'max'),
@@ -2637,40 +2515,34 @@ def load_manifest(contents, filename):
     prevent_initial_call=True,
 )
 def setup_trajectory(base_name, exp_dir):
-    """Configura los controles de trayectoria para el diseño seleccionado.
-
-    Los componentes del slider, botones y Store están SIEMPRE en el layout
-    estático (no se crean/destruyen). Este callback solo actualiza sus
-    propiedades y controla su visibilidad vía CSS.
-
-    Al cambiar de diseño, pausa la animación automáticamente."""
+    """Configura los controles de trayectoria para el diseño seleccionado."""
     hide = {'display': 'none'}
     show = {'display': 'block'}
     empty_marks = {0: '0', 1: '1'}
-    # 7 outputs base + 3 de animación (pausar)
     paused = (True, '▶ Play', 'primary')
 
     if not base_name or not exp_dir:
         return None, 1, 0, empty_marks, hide, "", "", *paused, 1, None
 
-    cleanup_old_traj_files(
-        keep_basename=re.sub(r'_dldesign_\d+$', '', base_name))
-
     traj_pdb = get_trajectory_pdb(exp_dir, base_name)
+    keep_stem = os.path.splitext(os.path.basename(traj_pdb))[0] if traj_pdb else None
+    cleanup_old_traj_files(keep_basename=keep_stem)
+
     if not traj_pdb:
         print(f"[BinderMonitor] Trayectoria no encontrada para: {base_name}")
         msg = [html.I(className='bi bi-info-circle me-1'),
                'No se encontró trayectoria de RFdiffusion para este diseño.']
-        return None, 1, 0, empty_marks, hide, msg, f"Diseño: {base_name}", *paused, 1, None
+        store = {'pdb': None, 'hit': base_name, 'n_models': 0}
+        return store, 1, 0, empty_marks, hide, msg, f"Diseño: {base_name}", *paused, 1, None
 
     n_models = count_pdb_models(traj_pdb)
-    print(f"[BinderMonitor] Trayectoria encontrada: {traj_pdb} "
-          f"({n_models} modelos)")
+    print(f"[BinderMonitor] Trayectoria encontrada: {traj_pdb} ({n_models} modelos)")
 
     if n_models <= 1:
         msg = [html.I(className='bi bi-info-circle me-1'),
                f'PDB de trayectoria mono-modelo ({n_models} bloques).']
-        return None, 1, 0, empty_marks, hide, msg, f"Diseño: {base_name}", *paused, 1, None
+        store = {'pdb': None, 'hit': base_name, 'n_models': n_models}
+        return store, 1, 0, empty_marks, hide, msg, f"Diseño: {base_name}", *paused, 1, None
 
     marks = {0: 'ruido', n_models - 1: 'final'}
     if n_models >= 5:
@@ -2680,9 +2552,8 @@ def setup_trajectory(base_name, exp_dir):
 
     info = (f"Diseño: {base_name} · Trayectoria: "
             f"{os.path.basename(traj_pdb)} · {n_models} pasos")
-
-    # Arranca mostrando la estructura final (paso N). goto-input 1-indexado.
-    return (traj_pdb, n_models - 1, n_models - 1, marks,
+    store = {'pdb': traj_pdb, 'hit': base_name, 'n_models': n_models}
+    return (store, n_models - 1, n_models - 1, marks,
             show, "", info, *paused, n_models, n_models)
 
 
@@ -2699,10 +2570,9 @@ def setup_trajectory(base_name, exp_dir):
     prevent_initial_call=True,
 )
 def jump_slider(_first, _last, _prev, _next, goto, mn, mx, cur):
-    """Atajos de navegación de la trayectoria:
-      ⏮ primer paso · ◀ anterior · ▶ siguiente · ⏭ último ·
-      input numérico (1-indexado) para ir a un paso concreto.
-    Todos respetan el orden lógico ruido(1) → final(N)."""
+    """Atajos de navegación de la trayectoria (1-indexado en input manual)."""
+    mn = 0 if mn is None else int(mn)
+    mx = 1 if mx is None else int(mx)
     trig = ctx.triggered_id
     if trig == 'traj-first':
         return mn
@@ -2713,45 +2583,15 @@ def jump_slider(_first, _last, _prev, _next, goto, mn, mx, cur):
     if trig == 'traj-next':
         return min(mx, (cur if cur is not None else mn) + 1)
     if trig == 'traj-goto-input':
-        if goto is None:
+        try:
+            idx = int(goto) - 1
+        except (TypeError, ValueError):
             raise PreventUpdate
-        # input 1-indexado → índice lógico 0-indexado, recortado al rango
-        idx = int(goto) - 1
         return max(mn, min(mx, idx))
     raise PreventUpdate
 
 
-# ---- CALLBACKS DEL VISOR 3D ------------------------------------------------
-#
-# Un callback NO SE EJECUTA si alguno de sus Inputs no existe en el DOM,
-# ni siquiera con suppress_callback_exceptions=True. Esa flag solo permite
-# REGISTRAR el callback sin error al arrancar la app.
-#
-# Esto tiene una consecuencia directa aquí: traj-slider, traj-show-final
-# y traj-pdb-store son componentes DINÁMICOS que build_trajectory_controls()
-# crea o destruye según el diseño seleccionado. Si metemos esos Inputs
-# dinámicos en el mismo callback que hit-dropdown (estático), el callback
-# entero queda bloqueado hasta que los dinámicos existan.
-#
-# La solución: DOS callbacks separados.
-#
-#   Callback A (PRIMARIO): Solo Inputs estáticos (hit-dropdown).
-#   Se dispara SIEMPRE que el usuario selecciona un diseño.
-#   Carga la estructura AF2 final.
-#
-#   Callback B (SECUNDARIO, allow_duplicate=True): Solo Inputs dinámicos
-#   (traj-slider, traj-show-final). Se dispara solo cuando existen, es
-#   decir, después de que build_trajectory_controls() haya creado el
-#   slider. Carga frames de trayectoria o vuelve a la estructura AF2.
-#
-# allow_duplicate=True en el Callback B es seguro aquí: indica a Dash
-# que DOS callbacks pueden escribir en molstar-viewer.data. El último
-# que escriba gana. No hay race condition porque los triggers son
-# mutuamente excluyentes (o mueves el slider O seleccionas un hit,
-# pero no ambos a la vez).
-# -------------------------------------------------------------------------
-
-# ---- Callback A: carga AF2 al seleccionar un diseño (PRIMARIO) ----------
+# ---- Callback A: carga estructura final al seleccionar diseño ------------
 @callback(
     Output('molstar-viewer', 'data'),
     Input('hit-dropdown', 'value'),
@@ -2759,9 +2599,7 @@ def jump_slider(_first, _last, _prev, _next, goto, mn, mx, cur):
     prevent_initial_call=True,
 )
 def load_af2_structure(hit_basename, exp_dir):
-    """Carga la estructura final (AlphaFold2 o Complexa) cuando se selecciona un
-    diseño en el dropdown. Este callback usa SOLO inputs estáticos
-    (que siempre existen en el DOM), así que siempre se dispara."""
+    """Carga la estructura final (AlphaFold2 o Complexa) al elegir un diseño."""
     if not hit_basename or not exp_dir:
         raise PreventUpdate
 
@@ -2774,35 +2612,35 @@ def load_af2_structure(hit_basename, exp_dir):
     return molstar_helper.parse_molecule(file_to_load, 'pdb')
 
 
-# ---- Callback B: trayectoria o botón "Estructura final" (SECUNDARIO) ----
+# ---- Callback B: trayectoria o botón "Estructura final" ------------------
 @callback(
     Output('molstar-viewer', 'data', allow_duplicate=True),
     Input('traj-slider', 'value'),
     Input('traj-show-final', 'n_clicks'),
-    State('traj-pdb-store', 'data'),
+    Input('traj-pdb-store', 'data'),
     State('experiment-dropdown', 'value'),
     State('hit-dropdown', 'value'),
     prevent_initial_call=True,
 )
-def load_trajectory_or_final(slider_idx, _final_clicks, traj_pdb,
+def load_trajectory_or_final(slider_idx, _final_clicks, traj_store,
                              exp_dir, hit_basename):
-    """Carga un frame de trayectoria (slider) o vuelve a la estructura
-    AF2 (botón "Estructura final"). Los Inputs (traj-slider, traj-show-final)
-    son componentes ESTÁTICOS que siempre existen en el DOM."""
+    """Carga un frame de trayectoria (slider) o vuelve a la estructura final.
+    Si el disparo proviene de `setup_trajectory` (cambio de `traj-pdb-store`),
+    no pisa la estructura final recién cargada por `load_af2_structure`."""
+    if 'traj-pdb-store.data' in ctx.triggered_prop_ids:
+        raise PreventUpdate
+
     triggered = ctx.triggered_id
-    print(f"[BinderMonitor] Callback traj disparado: triggered={triggered}, "
-          f"slider={slider_idx}, traj_pdb={traj_pdb}")
+    traj_pdb, n_total = _unpack_traj_store(traj_store)
 
     if triggered == 'traj-slider':
-        if slider_idx is None or not traj_pdb or not os.path.exists(traj_pdb):
+        if slider_idx is None or not traj_pdb or not os.path.exists(traj_pdb) or n_total <= 0:
             raise PreventUpdate
-        n_total = count_pdb_models(traj_pdb)
         phys = logical_to_physical_model(slider_idx, n_total)
         extracted = extract_pdb_model_streaming(traj_pdb, phys)
         if not extracted:
             raise PreventUpdate
-        print(f"[BinderMonitor] Trayectoria → lógico {slider_idx} "
-              f"→ físico {phys} → {extracted}")
+        print(f"[BinderMonitor] Trayectoria → lógico {slider_idx} → físico {phys} → {extracted}")
         return molstar_helper.parse_molecule(extracted, 'pdb')
 
     if triggered == 'traj-show-final':
@@ -2818,23 +2656,18 @@ def load_trajectory_or_final(slider_idx, _final_clicks, traj_pdb,
     raise PreventUpdate
 
 
-# ---- Callback C: etiqueta del frame de trayectoria -------------------------
-# Solo se dispara al mover el slider. En ese momento, traj-frame-label
-# ya existe en el DOM (se crea junto con el slider en
-# build_trajectory_controls).
+# ---- Callback C: etiqueta del frame de trayectoria -----------------------
 @callback(
     Output('traj-frame-label', 'children'),
     Input('traj-slider', 'value'),
     State('traj-pdb-store', 'data'),
     prevent_initial_call=True,
 )
-def update_traj_label(slider_idx, traj_pdb):
-    """Actualiza el texto del frame al mover el slider. El índice del slider
-    es LÓGICO: 0 = ruido inicial, n-1 = estructura final, siempre en ese
-    sentido aunque el PDB esté grabado al revés."""
-    if slider_idx is None or not traj_pdb:
+def update_traj_label(slider_idx, traj_store):
+    """Actualiza el texto del frame usando el conteo cacheado en `traj-pdb-store`."""
+    traj_pdb, n_total = _unpack_traj_store(traj_store)
+    if slider_idx is None or not traj_pdb or n_total <= 0:
         raise PreventUpdate
-    n_total = count_pdb_models(traj_pdb)
     paso = slider_idx + 1
     etiqueta = ''
     if slider_idx == 0:
@@ -2855,9 +2688,9 @@ def shutdown_server(n):
     if n:
         _cleanup_temp_dir()
         port = PORT_LABEL if PORT_LABEL != "?" else 8050
-        # Enviar señal de terminación al propio proceso
-        os.kill(os.getpid(), signal.SIGTERM)
+        threading.Timer(0.4, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
         return f"🛑 Servidor apagado. El puerto {port} ha sido liberado. Puedes cerrar esta pestaña."
+    raise PreventUpdate
 
 
 # =============================================================================
@@ -2991,7 +2824,7 @@ def update_radar(hit_name, cache):
         return _empty_radar("Diseño no encontrado"), ""
     hit_row = hit_row.iloc[0]
 
-    radar_metrics = PIPELINE.get('radar_metrics') or RADAR_METRICS
+    radar_metrics = _get_pipeline().get('radar_metrics') or RADAR_METRICS
     present = []
     for m in radar_metrics:
         if m in df.columns:
@@ -3007,11 +2840,11 @@ def update_radar(hit_name, cache):
 
     labels, radii, hovertexts, table_rows = [], [], [], []
     for m in present:
-        col = pd.to_numeric(df[m], errors='coerce')
+        valid = pd.to_numeric(df[m], errors='coerce').dropna()
         val = pd.to_numeric(hit_row[m], errors='coerce')
-        if pd.isna(val) or col.notna().sum() < 2:
+        if pd.isna(val) or len(valid) < 2:
             continue
-        pct = float((col < val).mean())
+        pct = float((valid < val).mean() + 0.5 * (valid == val).mean())
         sense = radar_metrics.get(m, 'low')
         quality = pct if sense == 'high' else (1.0 - pct)
         arrow = '↑' if sense == 'high' else '↓'
@@ -3140,7 +2973,7 @@ def save_annotations(_n, hit_name, exp_dir, tags, note):
     ok_tags = set_design_tags(exp_dir, hit_name, tags)
     ok_note = set_design_note(exp_dir, hit_name, note)
     if ok_tags and ok_note:
-        n_tags = len(tags or [])
+        n_tags = len([t for t in (tags or []) if t])
         snapshot = get_all_annotations(exp_dir)
         return (f"✓ Guardado ({n_tags} tag{'s' if n_tags != 1 else ''}).",
                 snapshot)

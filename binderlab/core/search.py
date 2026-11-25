@@ -1,25 +1,19 @@
-"""Motor de filtrado y busqueda sobre las tablas de metricas.
+"""Motor de filtrado y búsqueda sobre las tablas de métricas.
 
-Reglas clasicas (columna/operador/valor), expresiones libres estilo pandas,
-columnas calculadas e inyeccion de anotaciones. Modulo puro: solo pandas.
+Reglas clásicas (columna/operador/valor), expresiones libres estilo pandas,
+columnas calculadas, ordenación e inyección de anotaciones. Módulo puro: solo pandas.
 """
+from itertools import zip_longest
 import pandas as pd
 
 
 def coerce_numeric_columns(df):
-    """Devuelve una copia de `df` con las columnas convertidas a numerico
-    cuando se puede sin perder informacion.
-
-    Las tablas que vienen del cache traen numeros guardados como texto; sin
-    esta conversion, comparar `pae < 10` compararia cadenas. Solo se
-    sustituye la columna si la conversion no introduce NaN nuevos, para no
-    destruir columnas de texto legitimas.
-
-    (Antes este bucle estaba duplicado en apply_expression y en
-    apply_computed_columns.)
-    """
+    """Devuelve una copia de `df` convirtiendo a numérico las columnas que no
+    pierden información al convertirse."""
     out = df.copy()
     for c in out.columns:
+        if pd.api.types.is_numeric_dtype(out[c]) or pd.api.types.is_bool_dtype(out[c]):
+            continue
         conv = pd.to_numeric(out[c], errors='coerce')
         if conv.notna().sum() >= out[c].notna().sum():
             out[c] = conv
@@ -41,9 +35,7 @@ NUMERIC_OPS = {'>', '<', '>=', '<=', '==', '!='}
 
 
 def coerce_value(op, raw_val):
-    """Convierte el valor introducido en la UI al tipo correcto según el
-    operador. Si el operador es numérico y el valor no se puede convertir
-    a float, devuelve None (la regla se descartará)."""
+    """Convierte el valor introducido al tipo requerido por el operador."""
     if op in NUMERIC_OPS:
         try:
             return float(raw_val)
@@ -53,13 +45,13 @@ def coerce_value(op, raw_val):
 
 
 def apply_rule(df, col, op, val):
-    """Aplica una regla a un DataFrame y devuelve la máscara booleana.
-    Devuelve None si la columna no existe o el operador no es aplicable."""
+    """Aplica una regla a un DataFrame y devuelve la máscara booleana (o None)."""
     if col not in df.columns:
         return None
     series = df[col]
     if op in NUMERIC_OPS:
-        # Forzar la columna a numérica; valores no convertibles → NaN
+        if val is None:
+            return None
         s = pd.to_numeric(series, errors='coerce')
         try:
             if op == '>=': return s >= val
@@ -70,26 +62,21 @@ def apply_rule(df, col, op, val):
             if op == '!=': return s != val
         except Exception:
             return None
-    s_str = series.astype(str)
+    s_str = series.fillna('').astype(str)
     if op == 'contains':
-        return s_str.str.contains(str(val), na=False, case=False)
+        return s_str.str.contains(str(val), na=False, case=False, regex=False)
     if op == 'not_contains':
-        return ~s_str.str.contains(str(val), na=False, case=False)
+        return ~s_str.str.contains(str(val), na=False, case=False, regex=False)
     if op == 'startswith':
         return s_str.str.startswith(str(val), na=False)
     return None
 
 
-# Atributos que nunca deben aparecer en una expresion de usuario. pandas.eval
-# bloquea las llamadas a funciones no permitidas, asi que NO hay ejecucion
-# arbitraria; pero el acceso a atributos dunder si funciona y filtra objetos
-# internos (p.ej. `col.__class__.__init__.__globals__` devuelve un dict).
-# Como ninguna expresion legitima de filtrado los necesita, se rechazan.
 ATRIBUTOS_PROHIBIDOS = ('__', 'globals', 'builtins', 'import')
 
 
 def expresion_insegura(expr):
-    """Devuelve el motivo por el que la expresion no es aceptable, o None."""
+    """Devuelve el motivo por el que la expresión no es aceptable, o None."""
     texto = str(expr)
     for patron in ATRIBUTOS_PROHIBIDOS:
         if patron in texto:
@@ -98,17 +85,8 @@ def expresion_insegura(expr):
 
 
 def apply_expression(df, expr):
-    """Evalúa una expresión de texto libre estilo pandas sobre el DataFrame
-    (m01 — modo expresión). Equivalente al modo `df.eval()` que ya soporta
-    extract_hits.py por CLI.
-
-    Devuelve (mask, error). Si la expresión compila y produce una máscara
-    booleana, error=None. Si falla (columna inexistente, sintaxis inválida,
-    o resultado no booleano), mask=None y error=mensaje legible.
-
-    Para que las columnas numéricas guardadas como texto en el cache se
-    comparen bien, se intenta convertir a numérico todo lo que se pueda
-    antes de evaluar (sin destruir las columnas de texto)."""
+    """Evalúa una expresión booleana estilo pandas sobre `df`.
+    Devuelve `(mask, error)`."""
     if not expr or not str(expr).strip():
         return None, "expresión vacía"
     motivo = expresion_insegura(expr)
@@ -119,24 +97,22 @@ def apply_expression(df, expr):
         result = df_eval.eval(str(expr), engine='python')
     except Exception as e:
         return None, f"{type(e).__name__}: {e}"
-    if not hasattr(result, 'dtype') or result.dtype != bool:
+    if not hasattr(result, 'dtype') or not pd.api.types.is_bool_dtype(result):
         return None, ("la expresión no devuelve una condición booleana "
                       "(usa comparadores: >=, <=, ==, and, or)")
-    return result.reindex(df.index).fillna(False), None
+    if isinstance(result, pd.Series):
+        mask = result.reindex(df.index).fillna(False).astype(bool)
+    else:
+        mask = pd.Series(result, index=df.index).fillna(False).astype(bool)
+    return mask, None
 
 
 def apply_computed_columns(df, computed):
-    """Añade al DataFrame las columnas computadas definidas por el usuario
-    (m09). `computed` es una lista de dicts {'name', 'expr'}. Cada expresión
-    se evalúa con df.eval() sobre las columnas numéricas; los fallos se
-    ignoran silenciosamente (la columna simplemente no se añade).
-
-    Devuelve el DataFrame (posiblemente con columnas nuevas). No muta el
-    original cuando hay columnas que añadir (trabaja sobre una copia)."""
+    """Añade al DataFrame las columnas computadas `{'name', 'expr'}` en orden,
+    permitiendo que una columna computada referencie otras previas."""
     if not computed:
         return df
     df = df.copy()
-    # Versión numérica para evaluar de forma fiable
     df_num = coerce_numeric_columns(df)
     for item in computed:
         name = (item or {}).get('name')
@@ -148,20 +124,16 @@ def apply_computed_columns(df, computed):
             print(f"[BinderMonitor] Columna '{name}' rechazada: {motivo}")
             continue
         try:
-            df[name] = df_num.eval(str(expr), engine='python')
+            col_val = df_num.eval(str(expr), engine='python')
+            df[name] = col_val
+            df_num[name] = pd.to_numeric(col_val, errors='coerce') if not pd.api.types.is_numeric_dtype(col_val) else col_val
         except Exception as e:
             print(f"[BinderMonitor] Columna computada '{name}' falló: {e}")
     return df
 
 
 def inject_annotation_columns(df, annotations):
-    """Añade las columnas `_tags` (texto con los tags separados por ' ') y
-    `_note` (texto libre) al DataFrame, cruzando por `base_name`.
-
-    `annotations` es el dict {design_name: {'tags', 'note'}}. Si el DataFrame
-    no tiene `base_name` o no hay anotaciones, se devuelve sin cambios.
-    Tener estas columnas hace que las anotaciones sean filtrables como
-    cualquier otra: «_tags contains ⭐» es una regla normal."""
+    """Añade las columnas `_tags` y `_note` cruzando por `base_name`."""
     if not annotations or 'base_name' not in df.columns:
         return df
     df = df.copy()
@@ -170,3 +142,81 @@ def inject_annotation_columns(df, annotations):
     df['_note'] = df['base_name'].map(
         lambda bn: annotations.get(bn, {}).get('note', ''))
     return df
+
+
+def evaluate_filter_rules(df, cols, ops, vals, modes, exprs):
+    """Aplica todas las reglas (clásicas y expresiones) y devuelve `(mask, funnel_lines)`."""
+    funnel_lines = [f"[*] Iniciales: {len(df)}"]
+    mask_global = pd.Series(True, index=df.index)
+
+    for col, op, val, mode, expr in zip_longest(
+            cols or [], ops or [], vals or [], modes or [], exprs or []):
+        if mode == 'expr':
+            if not expr or not str(expr).strip():
+                continue
+            m, err = apply_expression(df, expr)
+            if err:
+                funnel_lines.append(f"  [!] expr «{expr}» → {err}. Regla ignorada.")
+                continue
+            before = int(mask_global.sum())
+            mask_global &= m
+            survivors = int(mask_global.sum())
+            funnel_lines.append(f"  → expr «{expr}»   supervivientes: {survivors}")
+            if survivors == 0 and before > 0:
+                funnel_lines.append("     ⚠ 0 supervivientes tras esta expresión.")
+            elif before > 0 and survivors / before < 0.05:
+                pct = 100 * (1 - survivors / before)
+                funnel_lines.append(f"     ⚠ esta expresión eliminó el {pct:.0f}% restante.")
+            continue
+
+        if not col or not op or val is None or val == '':
+            continue
+        coerced = coerce_value(op, val)
+        if op in NUMERIC_OPS and coerced is None:
+            funnel_lines.append(
+                f"  [!] [{col} {op} {val}] → valor no numérico, regla ignorada.")
+            continue
+        m = apply_rule(df, col, op, coerced)
+        if m is None:
+            funnel_lines.append(
+                f"  [!] [{col} {op} {val}] → operador no aplicable, regla ignorada.")
+            continue
+
+        before = int(mask_global.sum())
+        mask_global &= m.fillna(False)
+        survivors = int(mask_global.sum())
+        funnel_lines.append(f"  → [{col} {op} {val}]   supervivientes: {survivors}")
+
+        col_num = pd.to_numeric(df[col], errors='coerce')
+        if survivors == 0 and before > 0:
+            if op in ('>=', '>') and col_num.notna().any():
+                sug = round(float(col_num.quantile(0.10)), 3)
+                funnel_lines.append(
+                    f"     ⚠ 0 supervivientes. Máximo de '{col}' = "
+                    f"{col_num.max():.3g}. Prueba con ≥ {sug} (p10).")
+            elif op in ('<=', '<') and col_num.notna().any():
+                sug = round(float(col_num.quantile(0.90)), 3)
+                funnel_lines.append(
+                    f"     ⚠ 0 supervivientes. Mínimo de '{col}' = "
+                    f"{col_num.min():.3g}. Prueba con ≤ {sug} (p90).")
+            else:
+                funnel_lines.append(
+                    "     ⚠ 0 supervivientes tras esta regla. Revisa el valor.")
+        elif before > 0 and survivors / before < 0.05:
+            pct = 100 * (1 - survivors / before)
+            funnel_lines.append(
+                f"     ⚠ esta regla eliminó el {pct:.0f}% de los diseños "
+                f"que quedaban. ¿Umbral demasiado estricto?")
+
+    return mask_global, funnel_lines
+
+
+def sort_dataframe(df, sort_by, sort_asc=True):
+    """Ordena `df` por `sort_by` (numéricamente cuando es posible)."""
+    if not sort_by or sort_by not in df.columns or df.empty:
+        return df
+    out = df.copy()
+    conv = pd.to_numeric(out[sort_by], errors='coerce')
+    if conv.notna().sum() >= out[sort_by].notna().sum():
+        out[sort_by] = conv
+    return out.sort_values(by=sort_by, ascending=bool(sort_asc), na_position='last')

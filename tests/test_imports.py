@@ -8,9 +8,11 @@ def test_dispatcher_conoce_los_4_subcomandos():
     assert set(_COMMANDS) == {"monitor", "corr", "dna", "score"}
 
 
-def test_cli_help():
+def test_cli_help_and_version():
     assert main(["--help"]) == 0
     assert main([]) == 0
+    assert main(["--version"]) == 0
+    assert main(["-V"]) == 0
 
 
 def test_import_sin_side_effects():
